@@ -21,9 +21,17 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import (
+    PPMissingLayer,
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+)
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -828,12 +836,16 @@ class WanTransformer3DModel(nn.Module):
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
-        self.patch_embedding = Conv3dLayer(
-            in_channels=in_channels,
-            out_channels=inner_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
+        # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
+        if get_pp_group().is_first_rank:
+            self.patch_embedding = Conv3dLayer(
+                in_channels=in_channels,
+                out_channels=inner_dim,
+                kernel_size=patch_size,
+                stride=patch_size,
+            )
+        else:
+            self.patch_embedding = PPMissingLayer()
 
         # 2. Condition embeddings
         self.condition_embedder = WanTimeTextImageEmbedding(
@@ -845,21 +857,32 @@ class WanTransformer3DModel(nn.Module):
             pos_embed_seq_len=pos_embed_seq_len,
         )
 
-        # 3. Transformer blocks
-        self.blocks = nn.ModuleList(
-            [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
-                for _ in range(num_layers)
-            ]
+        # 3. Transformer blocks — partitioned across PP stages via vLLM's `make_layers`.
+        # It computes the [start_layer, end_layer) slice for this rank and fills the remaining slots
+        # with PPMissingLayer so that weight names stay globally consistent.
+        self.start_layer, self.end_layer, self.blocks = make_layers(
+            num_layers,
+            lambda prefix: WanTransformerBlock(
+                inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm
+            ),
+            prefix="blocks",
         )
 
-        # 4. Output norm & projection
-        self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        # 4. Output norm & projection — only on the last PP stage
+        if get_pp_group().is_last_rank:
+            self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
+            self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
+        else:
+            self.norm_out, self.proj_out = PPMissingLayer(), PPMissingLayer()
 
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
-        self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
+        if get_pp_group().is_last_rank:
+            self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
+        else:
+            self.output_scale_shift_prepare = PPMissingLayer()
+
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(["hidden_states"], inner_dim)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -872,9 +895,10 @@ class WanTransformer3DModel(nn.Module):
         timestep: torch.LongTensor,
         encoder_hidden_states: torch.Tensor,
         encoder_hidden_states_image: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -884,18 +908,25 @@ class WanTransformer3DModel(nn.Module):
         # Compute RoPE embeddings (sharded by _sp_plan via split_output=True)
         rotary_emb = self.rope(hidden_states)
 
-        # Patch embedding and flatten to sequence
-        # (hidden_states is sharded at blocks.0 input by _sp_plan)
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        if get_pp_group().is_first_rank:
+            # Patch embedding and flatten to sequence
+            # (hidden_states is sharded at blocks.0 input by _sp_plan)
+            hidden_states = self.patch_embedding(hidden_states)
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        else:
+            if intermediate_tensors is None:
+                raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
+            hidden_states = intermediate_tensors["hidden_states"]
 
-        # Handle timestep shape
+        # Handle timestep shape (2-D for TI2V, 1-D for T2V)
         if timestep.ndim == 2:
             ts_seq_len = timestep.shape[1]
             timestep = timestep.flatten()
         else:
             ts_seq_len = None
 
+        # Compute conditioning on all PP stages.
+        # Each stage needs temb/timestep_proj for scale-shift modulation in its local blocks.
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
         )
@@ -931,8 +962,13 @@ class WanTransformer3DModel(nn.Module):
             hidden_states_mask = None
 
         # Transformer blocks
-        for block in self.blocks:
+        for block in self.blocks[self.start_layer : self.end_layer]:
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+
+        if not get_pp_group().is_last_rank:
+            # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
+            # predict_noise will broadcast it to the next stage before calling that stage's forward.
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)
@@ -1001,6 +1037,9 @@ class WanTransformer3DModel(nn.Module):
                 if weight_name not in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
+                # Skip weights that belong to PP stages other than this one
+                if is_pp_missing_parameter(lookup_name, self):
+                    break
                 param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -1014,6 +1053,10 @@ class WanTransformer3DModel(nn.Module):
 
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+
+                # Skip weights that belong to PP stages other than this one
+                if is_pp_missing_parameter(lookup_name, self):
+                    continue
 
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")

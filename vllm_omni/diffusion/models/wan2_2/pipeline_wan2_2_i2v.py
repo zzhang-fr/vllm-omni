@@ -16,10 +16,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pp_parallel import PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -143,7 +145,12 @@ def get_wan22_i2v_pre_process_func(
 
 
 class Wan22I2VPipeline(
-    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    SupportImageInput,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -546,8 +553,8 @@ class Wan22I2VPipeline(
                 else:
                     negative_kwargs = None
 
-                # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_cfg(
+                # Predict noise with automatic PP + CFG parallel handling
+                noise_pred = self.predict_noise_maybe_with_pp_and_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
                     positive_kwargs=positive_kwargs,
@@ -555,8 +562,8 @@ class Wan22I2VPipeline(
                     cfg_normalize=False,
                 )
 
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic PP + CFG sync
+                latents = self.scheduler_step_maybe_with_pp_and_cfg(noise_pred, t, latents, do_true_cfg)
 
                 pbar.update()
 
@@ -620,20 +627,29 @@ class Wan22I2VPipeline(
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
         Args:
             current_model: The transformer model to use (transformer or transformer_2)
+            intermediate_tensors: states and residuals received from the previous stage.
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors for PP
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs, intermediate_tensors=intermediate_tensors)
+        if isinstance(result, IntermediateTensors):
+            return result
+        return result[0]
 
     def encode_prompt(
         self,
