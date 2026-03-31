@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -121,6 +122,22 @@ class DiffusionModelRunner:
             if memory_pool_context_fn is not None:
                 return memory_pool_context_fn(tag="weights")
             return nullcontext()
+
+        # Propagate attention backend from config to env var for selector.py
+        if self.od_config.attention_backend and not os.environ.get("DIFFUSION_ATTENTION_BACKEND"):
+            os.environ["DIFFUSION_ATTENTION_BACKEND"] = self.od_config.attention_backend
+
+        # Warn if sparse_attn config is set but the backend is a known dense one
+        selected_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND", "").upper()
+        if self.od_config.sparse_attn is not None and selected_backend:
+            dense_backends = {"FLASH_ATTN", "TORCH_SDPA", "SAGE_ATTN"}
+            if selected_backend in dense_backends:
+                logger.warning(
+                    "sparse_attn config is set but --attn-backend '%s' is a dense "
+                    "backend that ignores sparse_attn config. "
+                    "Use --attn-backend spargeattn (or another sparse plugin) instead.",
+                    selected_backend,
+                )
 
         # Load model within forward context
         load_config = LoadConfig()

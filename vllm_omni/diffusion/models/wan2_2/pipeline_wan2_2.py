@@ -30,6 +30,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
+
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 
@@ -295,6 +296,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             self.transformer_config = self.transformer_2.config
         else:
             raise RuntimeError("No transformer loaded")
+
+        # Sparse attention is now handled via the attention backend
+        # (sparse_attention) — no explicit enable_sparse_attention call needed.
 
         # Initialize UniPC scheduler
         flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
@@ -568,7 +572,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for _step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model based on timestep and boundary_ratio

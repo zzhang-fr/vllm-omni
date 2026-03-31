@@ -3,7 +3,10 @@
 
 import math
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionSparseAttnConfig
 
 import torch
 import torch.nn as nn
@@ -421,12 +424,10 @@ class WanSelfAttention(nn.Module):
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        # Create attention metadata if mask is provided
+        # Compute attention
         attn_metadata = None
         if attn_mask is not None:
             attn_metadata = AttentionMetadata(attn_mask=attn_mask)
-
-        # Compute attention using unified attention layer
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -535,6 +536,7 @@ class WanCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            is_self_attention=False,
         )
 
     def forward(

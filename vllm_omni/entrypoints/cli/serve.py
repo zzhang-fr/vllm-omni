@@ -268,6 +268,17 @@ class OmniServeCommand(CLISubcommand):
             help="Enable cache-dit summary logging after diffusion forward passes.",
         )
 
+        # Attention backend selection
+        omni_config_group.add_argument(
+            "--attn-backend",
+            type=str,
+            default=None,
+            help="Attention backend for DiT modules. "
+            "Simple name: flash_attn, torch_sdpa, sage_attn, spargeattn. "
+            "JSON with config: '{\"backend\":\"spargeattn\",\"topk_ratio\":0.3}'. "
+            "Can also be set via DIFFUSION_ATTENTION_BACKEND env var.",
+        )
+
         # VAE memory optimization parameters
         omni_config_group.add_argument(
             "--vae-use-slicing",

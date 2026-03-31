@@ -337,6 +337,27 @@ class DiffusionCacheConfig:
 
 
 @dataclass
+class DiffusionSparseAttnConfig:
+    """Sparse attention configuration for DiT modules.
+
+    Stored in OmniDiffusionConfig.sparse_attn.
+    The dispatcher (_SparseAttentionImpl) uses `backend` to resolve a plugin
+    function and passes `topk_ratio` to it.
+    """
+
+    backend: str = "auto"
+    # "auto" | "dense" | short plugin name | "module.path:func_name"
+
+    topk_ratio: float = 0.5
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "DiffusionSparseAttnConfig":
+        field_names = {f.name for f in fields(cls)}
+        known = {k: v for k, v in d.items() if k in field_names}
+        return cls(**known)
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str | None = None
@@ -365,6 +386,9 @@ class OmniDiffusionConfig:
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+
+    # Sparse attention configuration for DiT modules
+    sparse_attn: DiffusionSparseAttnConfig | dict[str, Any] | None = None
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -595,6 +619,10 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        # Convert sparse_attn dict to DiffusionSparseAttnConfig if needed
+        if isinstance(self.sparse_attn, dict):
+            self.sparse_attn = DiffusionSparseAttnConfig.from_dict(self.sparse_attn)
+
         # Resolve quantization_config: str/dict -> QuantizationConfig via build_quant_config.
         if self.quantization_config is not None:
             if isinstance(self.quantization_config, QuantizationConfig):
@@ -681,7 +709,7 @@ class AttentionBackendEnum(enum.Enum):
     TORCH_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_THREE = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
+    SPARSE_ATTENTION = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     NO_ATTENTION = enum.auto()

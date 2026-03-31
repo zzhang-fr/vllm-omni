@@ -807,6 +807,61 @@ class AsyncOmniEngine:
                 )
             normalized_kwargs["dtype"] = str(normalized_kwargs["dtype"]).removeprefix("torch.")
 
+        # Handle --attn-backend: accepts simple name or JSON with config.
+        #   --attn-backend spargeattn
+        #   --attn-backend '{"backend":"spargeattn","topk_ratio":0.3}'
+        attn_backend_raw = normalized_kwargs.pop("attn_backend", None)
+        attn_backend = None
+        if isinstance(attn_backend_raw, str) and attn_backend_raw.strip().startswith("{"):
+            import json
+            try:
+                attn_config = json.loads(attn_backend_raw)
+                # "backend" in JSON is the sparse *plugin* name, not the
+                # AttentionBackend.  Store it in sparse_attn config and let
+                # the auto-select logic below pick "sparse_attention".
+                sparse_plugin = attn_config.pop("backend", None)
+                merged = dict(attn_config)
+                if sparse_plugin:
+                    merged["backend"] = sparse_plugin
+                existing = normalized_kwargs.get("sparse_attn")
+                if isinstance(existing, dict):
+                    existing.update(merged)
+                else:
+                    normalized_kwargs["sparse_attn"] = merged
+            except json.JSONDecodeError:
+                logger.warning("Invalid --attn-backend JSON: %s", attn_backend_raw)
+        elif attn_backend_raw:
+            attn_backend = attn_backend_raw
+
+        # Also handle --sparse-attn JSON string if passed separately
+        sparse_attn = normalized_kwargs.get("sparse_attn")
+        if isinstance(sparse_attn, str):
+            import json
+            try:
+                normalized_kwargs["sparse_attn"] = json.loads(sparse_attn)
+                sparse_attn = normalized_kwargs["sparse_attn"]
+            except json.JSONDecodeError:
+                logger.warning("Invalid --sparse-attn JSON: %s", sparse_attn)
+                normalized_kwargs["sparse_attn"] = None
+                sparse_attn = None
+
+        # If no --attn-backend but sparse_attn is configured, auto-select
+        # the sparse_attention dispatcher backend.  The sparse_attn.backend
+        # field names the *plugin* (e.g. "flashinfer", "spargeattn"), not the
+        # attention backend — the dispatcher is always "sparse_attention".
+        if not attn_backend:
+            _sparse_backend = None
+            if isinstance(sparse_attn, dict):
+                _sparse_backend = sparse_attn.get("backend")
+            elif hasattr(sparse_attn, "backend"):
+                _sparse_backend = sparse_attn.backend
+            if _sparse_backend and _sparse_backend not in ("none", "dense"):
+                attn_backend = "sparse_attention"
+
+        # Set env var for selector.py
+        if attn_backend and not os.environ.get("DIFFUSION_ATTENTION_BACKEND"):
+            os.environ["DIFFUSION_ATTENTION_BACKEND"] = attn_backend
+
         cache_backend = normalized_kwargs.get("cache_backend", "none")
         cache_config = AsyncOmniEngine._normalize_cache_config(
             cache_backend,
@@ -865,6 +920,7 @@ class AsyncOmniEngine:
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
                     "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
+                    "sparse_attn": kwargs.get("sparse_attn", None),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
