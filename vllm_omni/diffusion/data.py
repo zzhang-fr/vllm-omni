@@ -350,6 +350,48 @@ class DiffusionCacheConfig:
 
 
 @dataclass
+class DiffusionSparseAttnConfig:
+    """Sparse attention configuration for DiT modules.
+
+    Stored in OmniDiffusionConfig.sparse_attn.
+    vllm-omni owns only `backend`. All kernel-level parameters
+    (e.g. topk, block_size) go in `params` and are passed
+    directly to the plugin function — vllm-omni does not
+    interpret them.
+
+    Examples:
+        DiffusionSparseAttnConfig(backend="spargeattn", params={"topk": 0.5})
+        DiffusionSparseAttnConfig.from_dict({"backend": "spargeattn", "topk": 0.5})
+    """
+
+    backend: str = "auto"
+    # "auto" | "dense" | plugin short name | "module.path:func_name"
+
+    params: dict[str, Any] = field(default_factory=dict)
+    # Passed verbatim to: fn(q, k, v, params, is_causal) -> Tensor
+    # The plugin is responsible for reading what it needs.
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "DiffusionSparseAttnConfig":
+        """Accept flat or nested JSON.
+
+        Flat (unknown keys auto-routed into params):
+            {"backend": "spargeattn", "topk": 0.5}
+            -> DiffusionSparseAttnConfig(backend="spargeattn", params={"topk": 0.5})
+
+        Nested (explicit params key):
+            {"backend": "spargeattn", "params": {"topk": 0.5}}
+            -> DiffusionSparseAttnConfig(backend="spargeattn", params={"topk": 0.5})
+        """
+        backend = d.get("backend", "auto")
+        if "params" in d:
+            params = dict(d["params"])
+        else:
+            params = {k: v for k, v in d.items() if k != "backend"}
+        return cls(backend=backend, params=params)
+
+
+@dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     model: str | None = None
@@ -378,6 +420,9 @@ class OmniDiffusionConfig:
     cache_backend: str = "none"  # "tea_cache", "deep_cache", etc.
     cache_config: DiffusionCacheConfig | dict[str, Any] = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
+
+    # Sparse attention configuration for DiT modules
+    sparse_attn: DiffusionSparseAttnConfig | dict[str, Any] | None = None
 
     # Distributed executor backend
     distributed_executor_backend: str = "mp"
@@ -611,6 +656,10 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
+        # Convert sparse_attn dict to DiffusionSparseAttnConfig if needed
+        if isinstance(self.sparse_attn, dict):
+            self.sparse_attn = DiffusionSparseAttnConfig.from_dict(self.sparse_attn)
+
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
         # time.  For late (post-construction) assignment, callers should use
@@ -738,7 +787,6 @@ class AttentionBackendEnum(enum.Enum):
     TORCH_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()
     SAGE_ATTN_THREE = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     NO_ATTENTION = enum.auto()
