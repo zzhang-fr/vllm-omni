@@ -37,6 +37,7 @@ class Attention(nn.Module):
         gather_idx: int = 1,
         use_sync: bool = False,
         skip_sequence_parallel: bool = False,
+        is_self_attention: bool = True,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
@@ -47,6 +48,7 @@ class Attention(nn.Module):
             softmax_scale=softmax_scale,
             causal=causal,
             num_kv_heads=num_kv_heads,
+            is_self_attention=is_self_attention,
         )
         # Instantiate fallback backend for float32 support
         self.sdpa_fallback = SDPABackend.get_impl_cls()(

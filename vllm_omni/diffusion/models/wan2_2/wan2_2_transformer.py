@@ -426,12 +426,10 @@ class WanSelfAttention(nn.Module):
             query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
             key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        # Create attention metadata if mask is provided
+        # Compute attention
         attn_metadata = None
         if attn_mask is not None:
             attn_metadata = AttentionMetadata(attn_mask=attn_mask)
-
-        # Compute attention using unified attention layer
         hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -541,6 +539,7 @@ class WanCrossAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             skip_sequence_parallel=True,
+            is_self_attention=False,
         )
 
     def forward(
