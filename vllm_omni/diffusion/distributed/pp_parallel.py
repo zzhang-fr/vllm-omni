@@ -47,13 +47,17 @@ class AsyncLatents:
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
 
-    # Torch function protocol: any torch op involving a _PendingLatents resolves it first.
+    # Torch function protocol: any torch op involving an AsyncLatents resolves it first.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
 
         def _unwrap(x):
-            return x._resolve() if isinstance(x, AsyncLatents) else x
+            if isinstance(x, AsyncLatents):
+                return x._resolve()
+            if isinstance(x, (list, tuple)):
+                return type(x)(_unwrap(item) for item in x)  # type(x) return the class of x to preserve its type
+            return x
 
         args = tuple(_unwrap(a) for a in args)
         kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
