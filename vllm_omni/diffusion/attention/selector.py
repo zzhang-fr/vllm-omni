@@ -30,6 +30,33 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 logger = init_logger(__name__)
 
 
+def _get_plugin_backend_cls(name: str) -> "type[AttentionBackend] | None":
+    """Check vllm_omni.attn_backend entry_points for a plugin with this name.
+
+    For full AttentionBackend plugins (e.g. custom flash_attn replacement).
+    Sparse attention plugins should use the vllm_omni.sparse_attn entry
+    point group instead — they are resolved by the sparse_attention dispatcher.
+
+    Plugin packages declare themselves in pyproject.toml:
+        [project.entry-points."vllm_omni.attn_backend"]
+        my_backend = "my_package.backend:MyAttentionBackend"
+    """
+    try:
+        import importlib.metadata
+
+        for ep in importlib.metadata.entry_points(group="vllm_omni.attn_backend"):
+            if ep.name.lower() == name.lower():
+                logger.info(
+                    "Loading attention backend plugin '%s' from %s",
+                    name,
+                    ep.value,
+                )
+                return ep.load()
+    except Exception as e:
+        logger.debug("Plugin backend lookup failed for '%s': %s", name, e)
+    return None
+
+
 def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
     """Load a backend class from its fully qualified path.
 
@@ -76,7 +103,13 @@ def get_attn_backend(head_size: int) -> type[AttentionBackend]:
     # Check environment variable for user override
     selected_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
 
-    # Delegate to platform for backend selection
+    # Check entry_points plugins before enum lookup
+    if selected_backend:
+        plugin_cls = _get_plugin_backend_cls(selected_backend)
+        if plugin_cls is not None:
+            return plugin_cls
+
+    # Platform-based selection via enum
     backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
         selected_backend=selected_backend,
         head_size=head_size,
