@@ -538,6 +538,7 @@ class WanCrossAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             is_self_attention=False,
+            skip_sequence_parallel=True,
         )
 
     def forward(

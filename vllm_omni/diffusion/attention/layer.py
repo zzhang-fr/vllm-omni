@@ -37,6 +37,7 @@ class Attention(nn.Module):
         gather_idx: int = 1,
         use_sync: bool = False,
         is_self_attention: bool = True,
+        skip_sequence_parallel: bool = False,
     ):
         super().__init__()
         self.attn_backend = get_attn_backend(-1)
@@ -64,6 +65,7 @@ class Attention(nn.Module):
         self.gather_idx = gather_idx
         self.use_sync = use_sync
         self.causal = causal
+        self.skip_sequence_parallel = skip_sequence_parallel
 
         self.use_ring = False
         self.ring_pg = None
@@ -100,6 +102,8 @@ class Attention(nn.Module):
         (e.g., in noise_refiner/context_refiner before unified_prepare in Z-Image).
         This avoids unnecessary SP communication for layers not covered by _sp_plan.
         """
+        if self.skip_sequence_parallel:
+            return self._no_parallel_strategy
         if is_forward_context_available():
             ctx = get_forward_context()
             if not ctx.sp_active:
