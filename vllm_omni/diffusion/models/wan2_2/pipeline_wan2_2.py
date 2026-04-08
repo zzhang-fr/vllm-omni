@@ -660,6 +660,9 @@ class Wan22Pipeline(
 
                 pbar.update()
 
+        # Sync any pending non-blocking PP sends from the last denoising step.
+        self.sync_pp_send()
+
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
         if current_omni_platform.is_available():

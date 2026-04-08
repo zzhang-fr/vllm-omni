@@ -457,7 +457,11 @@ class GroupCoordinator:
             if tensor.numel() == 0:
                 continue
             group = self.cpu_group if tensor.is_cpu else self.device_group
-            handles.append(torch.distributed.isend(tensor, dst=self.ranks[dst], group=group))
+            handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
+            if tensor.is_cuda:
+                # Keep allocator from reusing this CUDA buffer before the async send finishes.
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
         return handles
 
     def irecv_tensor_dict(
@@ -486,7 +490,7 @@ class GroupCoordinator:
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=self.device)
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() > 0:
                     group = self.cpu_group if tensor.is_cpu else self.device_group
                     handles.append(torch.distributed.irecv(tensor, src=self.ranks[src], group=group))

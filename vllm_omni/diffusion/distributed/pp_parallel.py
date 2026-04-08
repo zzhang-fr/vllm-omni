@@ -84,6 +84,29 @@ class PipelineParallelMixin:
     PP stage operates on the correct encoder_hidden_states.
     """
 
+    @property
+    def _pp_send_work(self) -> list[torch.distributed.Work]:
+        if not hasattr(self, "__pp_send_work"):
+            self.__pp_send_work = []
+        return self.__pp_send_work
+
+    @_pp_send_work.setter
+    def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
+        self.__pp_send_work = work
+
+    def sync_pp_send(self) -> None:
+        """
+        Wait on all pending non-blocking PP sends.
+
+        Must be called after the denoising loop so that the isend handles
+        from the last iteration are completed before any subsequent
+        collective (e.g. VAE decode broadcast) or tensor reuse.
+        """
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+
     def predict_noise_maybe_with_pp_and_cfg(
         self,
         do_true_cfg: bool,
@@ -99,11 +122,12 @@ class PipelineParallelMixin:
         Returns:
             noise_pred on the first PP rank; None on all other ranks.
         """
-        pp_size = get_pipeline_parallel_world_size()
-        if pp_size == 1:
+        if get_pipeline_parallel_world_size() == 1:
             return self.predict_noise_maybe_with_cfg(
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
+
+        self.sync_pp_send()
 
         pp_group = get_pp_group()
         all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
@@ -120,7 +144,7 @@ class PipelineParallelMixin:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for kwargs, it in zip(all_kwargs, its):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
-                pp_group.isend_tensor_dict(result.tensors)
+                self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
         # Last rank: run full forwards (second half of transformer layers).
@@ -156,7 +180,7 @@ class PipelineParallelMixin:
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
-            pp_group.isend_tensor_dict({"latents": latents}, dst=pp_group.first_rank)
+            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=pp_group.first_rank)
         elif pp_group.is_first_rank:
             latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.last_rank))
         return latents
