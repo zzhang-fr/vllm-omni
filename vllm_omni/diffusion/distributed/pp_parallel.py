@@ -6,7 +6,13 @@ from typing import Any
 import torch
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
-from vllm_omni.diffusion.distributed.parallel_state import get_pipeline_parallel_world_size, get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+)
 
 
 class AsyncLatents:
@@ -119,8 +125,16 @@ class PipelineParallelMixin:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
 
+        Supports three modes:
+          - PP only, sequential CFG: both branches (cond and uncond) run through this PP pipeline.
+          - PP + CFG-parallel: each PP pipeline carries one branch. The last PP
+            rank all-gathers across the CFG group and combines, mirroring
+            CFGParallelMixin.predict_noise_maybe_with_cfg exactly.
+          - PP only, no CFG: cond branch only.
+
         Returns:
-            noise_pred on the first PP rank; None on all other ranks.
+            noise_pred on the last PP rank (and only on CFG rank 0 when CFG-parallel is active).
+            None on all other ranks.
         """
         if get_pipeline_parallel_world_size() == 1:
             return self.predict_noise_maybe_with_cfg(
@@ -130,10 +144,16 @@ class PipelineParallelMixin:
         self.sync_pp_send()
 
         pp_group = get_pp_group()
-        all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
 
-        # Non-first ranks receive all n ITs asynchronously.
-        # AsyncIntermediateTensors will wait on handles when .tensors is accessed.
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        if cfg_parallel_ready:
+            # Each PP pipeline carries exactly one CFG branch determined by cfg_rank.
+            all_kwargs = [positive_kwargs if get_classifier_free_guidance_rank() == 0 else negative_kwargs]
+        else:
+            # Sequential CFG (or no CFG): this PP pipeline handles all branches.
+            all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
+
+        # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
@@ -147,13 +167,31 @@ class PipelineParallelMixin:
                 self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
 
-        # Last rank: run full forwards (second half of transformer layers).
+        # Last rank: run full forward
         noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
 
-        # Last rank computes final noise_pred and will run scheduler
+        if cfg_parallel_ready:
+            # All-gather the single-branch prediction across the CFG group so that
+            # the positive and negative predictions are available on all CFG ranks.
+            local_pred = noise_preds[0]
+            if output_slice is not None:
+                local_pred = local_pred[:, :output_slice]
+            gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
+            if get_classifier_free_guidance_rank() == 0:
+                return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
+            return None
+
+        # Sequential CFG or no-CFG path.
         if do_true_cfg:
-            return self.combine_cfg_noise(noise_preds[0], noise_preds[1], true_cfg_scale, cfg_normalize)
-        return noise_preds[0]
+            pos, neg = noise_preds[0], noise_preds[1]
+            if output_slice is not None:
+                pos = pos[:, :output_slice]
+                neg = neg[:, :output_slice]
+            return self.combine_cfg_noise(pos, neg, true_cfg_scale, cfg_normalize)
+        pred = noise_preds[0]
+        if output_slice is not None:
+            pred = pred[:, :output_slice]
+        return pred
 
     def scheduler_step_maybe_with_pp_and_cfg(
         self,
@@ -180,7 +218,7 @@ class PipelineParallelMixin:
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
-            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=pp_group.first_rank)
+            self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.last_rank))
+            latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
         return latents

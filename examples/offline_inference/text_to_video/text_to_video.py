@@ -275,7 +275,7 @@ def main():
     print(
         f"  Parallel configuration: ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree},"
         f" cfg_parallel_size={args.cfg_parallel_size}, tensor_parallel_size={args.tensor_parallel_size},"
-        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, {args.pipeline_parallel_size=},"
+        f" vae_patch_parallel_size={args.vae_patch_parallel_size}, pipeline_parallel_size={args.pipeline_parallel_size},"
         f" enable_expert_parallel={args.enable_expert_parallel}"
     )
     print(f"  Video size: {args.width}x{args.height}")
