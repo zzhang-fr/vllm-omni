@@ -92,13 +92,13 @@ class PipelineParallelMixin:
 
     @property
     def _pp_send_work(self) -> list[torch.distributed.Work]:
-        if not hasattr(self, "__pp_send_work"):
-            self.__pp_send_work = []
-        return self.__pp_send_work
+        if not hasattr(self, "_pp_send_work_list"):
+            self._pp_send_work_list: list[torch.distributed.Work] = []
+        return self._pp_send_work_list
 
     @_pp_send_work.setter
     def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
-        self.__pp_send_work = work
+        self._pp_send_work_list = work
 
     def sync_pp_send(self) -> None:
         """
