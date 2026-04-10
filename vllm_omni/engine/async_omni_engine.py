@@ -1148,6 +1148,7 @@ class AsyncOmniEngine:
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
+            pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -1156,7 +1157,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
+                pipeline_parallel_size=pipeline_parallel_size,
                 data_parallel_size=1,
                 tensor_parallel_size=tensor_parallel_size,
                 sequence_parallel_size=sequence_parallel_size,
