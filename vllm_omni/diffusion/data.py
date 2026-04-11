@@ -30,6 +30,126 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# RFC #2632: per-role attention backend configuration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AttentionSpec:
+    """One backend selection plus its static (init-time) kwargs.
+
+    `extra` is forwarded to `AttentionImpl.__init__` as `backend_kwargs` and
+    intentionally has no schema — backends ignore unknown keys so that newer
+    backends can introduce options without changing the data model.
+    """
+
+    backend: str
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def coerce(cls, value: "AttentionSpec | str | Mapping[str, Any]") -> "AttentionSpec":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(backend=value, extra={})
+        if isinstance(value, Mapping):
+            backend = value.get("backend")
+            if not backend:
+                raise ValueError(f"AttentionSpec requires a non-empty 'backend' field, got {dict(value)!r}")
+            extra = value.get("extra", {}) or {}
+            if not isinstance(extra, Mapping):
+                raise TypeError(f"AttentionSpec.extra must be a mapping, got {type(extra).__name__}")
+            return cls(backend=str(backend), extra=dict(extra))
+        raise TypeError(f"Cannot coerce {type(value).__name__} to AttentionSpec")
+
+
+@dataclass
+class AttentionConfig:
+    """Per-role attention backend selection.
+
+    `default` applies to roles missing from `per_role`. When both are unset,
+    the selector falls back to the platform default — same as today's behavior
+    when `attention_backend` is `None`.
+    """
+
+    default: AttentionSpec | None = None
+    per_role: dict[str, AttentionSpec] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: "Mapping[str, Any] | None") -> "AttentionConfig":
+        if not data:
+            return cls()
+        default_spec: AttentionSpec | None = None
+        if data.get("default") is not None:
+            default_spec = AttentionSpec.coerce(data["default"])
+        per_role: dict[str, AttentionSpec] = {}
+        raw_per_role = data.get("per_role") or {}
+        if not isinstance(raw_per_role, Mapping):
+            raise TypeError(f"AttentionConfig.per_role must be a mapping, got {type(raw_per_role).__name__}")
+        for role, val in raw_per_role.items():
+            per_role[str(role)] = AttentionSpec.coerce(val)
+        return cls(default=default_spec, per_role=per_role)
+
+    @classmethod
+    def from_legacy(cls, attention_backend: str | None) -> "AttentionConfig":
+        """Build from the old scalar `attention_backend: str` setting."""
+        if not attention_backend:
+            return cls()
+        return cls(default=AttentionSpec(backend=attention_backend, extra={}))
+
+    @classmethod
+    def parse_cli(cls, value: str | None) -> "AttentionConfig":
+        """Parse the CLI / env var form.
+
+        - ``None`` / empty -> empty config (platform default).
+        - ``"FLASH_ATTN"`` -> default = FLASH_ATTN.
+        - ``"self=SAGE_ATTN,cross=TORCH_SDPA"`` -> per-role.
+
+        A bare token (no '=') is treated as the default backend. A token of
+        the form ``role=BACKEND`` is added to per_role. Mixing forms is allowed:
+        ``"FLASH_ATTN,cross=TORCH_SDPA"`` sets default=FLASH_ATTN and overrides
+        cross with TORCH_SDPA.
+        """
+        if value is None:
+            return cls()
+        value = value.strip()
+        if not value:
+            return cls()
+        default: AttentionSpec | None = None
+        per_role: dict[str, AttentionSpec] = {}
+        for raw in value.split(","):
+            tok = raw.strip()
+            if not tok:
+                continue
+            if "=" in tok:
+                role, backend = tok.split("=", 1)
+                role = role.strip().lower()
+                backend = backend.strip()
+                if not role or not backend:
+                    raise ValueError(f"Malformed attention backend token: {tok!r}")
+                # Validate role to fail loudly on typos.
+                from vllm_omni.diffusion.attention.role import AttentionRole
+
+                AttentionRole(role)  # raises if unknown
+                per_role[role] = AttentionSpec(backend=backend, extra={})
+            else:
+                if default is not None:
+                    raise ValueError(f"Multiple default backends in attention spec: {value!r}")
+                default = AttentionSpec(backend=tok, extra={})
+        return cls(default=default, per_role=per_role)
+
+    def is_empty(self) -> bool:
+        """True when no role-specific or default backend is set (use platform default)."""
+        return self.default is None and not self.per_role
+
+    def get(self, role: "str | None") -> AttentionSpec | None:
+        """Look up the spec for a role with fallback to default. None if neither set."""
+        if role is not None and role in self.per_role:
+            return self.per_role[role]
+        return self.default
+
+
 @config
 @dataclass
 class DiffusionParallelConfig:
@@ -362,7 +482,14 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
+    # Legacy: scalar backend name. Kept for backwards compatibility.
+    # When set and `attention` is not, it is auto-migrated to
+    # `AttentionConfig(default=AttentionSpec(backend=attention_backend))`.
     attention_backend: str | None = None
+    # RFC #2632 per-role attention backend config. May be passed as a dict
+    # (from YAML), an `AttentionConfig`, a `str` (legacy single backend), or
+    # `None` (use platform default).
+    attention: "AttentionConfig | dict[str, Any] | str | None" = None
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -583,6 +710,29 @@ class OmniDiffusionConfig:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) < parallel_config.world_size ({self.parallel_config.world_size})"
             )
+
+        # Normalize attention config (RFC #2632).
+        # Precedence: explicit `attention` > legacy `attention_backend` > empty.
+        if isinstance(self.attention, AttentionConfig):
+            pass  # already normalized
+        elif isinstance(self.attention, str):
+            self.attention = AttentionConfig.parse_cli(self.attention)
+        elif isinstance(self.attention, Mapping):
+            self.attention = AttentionConfig.from_dict(dict(self.attention))
+        elif self.attention is None:
+            if self.attention_backend:
+                self.attention = AttentionConfig.from_legacy(self.attention_backend)
+            else:
+                self.attention = AttentionConfig()
+        else:
+            raise TypeError(
+                f"OmniDiffusionConfig.attention must be AttentionConfig, dict, str, or None, "
+                f"got {type(self.attention).__name__}"
+            )
+        # Keep `attention_backend` mirrored to the resolved default backend so legacy
+        # code paths (e.g. `config.attention_backend`) still observe the user's choice.
+        if self.attention.default is not None and not self.attention_backend:
+            self.attention_backend = self.attention.default.backend
 
         # Convert string dtype to torch.dtype if needed
         if isinstance(self.dtype, str):

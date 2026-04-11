@@ -22,6 +22,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.role import AttentionRole
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -381,12 +382,16 @@ class HunyuanVideo15Attention(nn.Module):
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
+        # HunyuanVideo-1.5 uses dual-stream (joint) attention over the
+        # concatenated video + text streams, so we tag it as JOINT per
+        # RFC #2632.
         self.attn = Attention(
             num_heads=self.to_qkv.num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
             num_kv_heads=self.to_qkv.num_kv_heads,
+            role=AttentionRole.JOINT,
         )
 
     def forward(

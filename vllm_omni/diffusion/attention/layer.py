@@ -16,6 +16,7 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+from vllm_omni.diffusion.attention.role import AttentionRole
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -37,9 +38,31 @@ class Attention(nn.Module):
         gather_idx: int = 1,
         use_sync: bool = False,
         skip_sequence_parallel: bool = False,
+        # RFC #2632: per-role attention backend selection
+        role: AttentionRole | str = AttentionRole.SELF,
     ):
         super().__init__()
-        self.attn_backend = get_attn_backend(-1)
+        self.role = AttentionRole.coerce(role)
+
+        # RFC #2632: pull AttentionConfig from forward context (set during model load).
+        # Falls back gracefully when no forward context is active (unit tests).
+        attn_cfg = None
+        self.backend_pref = None
+        try:
+            ctx_cfg = get_forward_context().omni_diffusion_config
+            if ctx_cfg is not None:
+                self.backend_pref = ctx_cfg.attention_backend
+                attn_cfg = getattr(ctx_cfg, "attention", None)
+        except (AssertionError, AttributeError):
+            pass
+
+        self.attn_backend, spec = get_attn_backend(role=self.role, head_size=head_size, config=attn_cfg)
+        # Resolved backend name for logging / debugging. When no per-role
+        # config was provided the selector returns the sentinel spec
+        # "auto" — we fall back to the attn_backend class name.
+        self._resolved_backend = (
+            spec.backend if spec is not None and spec.backend not in (None, "auto") else self.attn_backend.get_name()
+        )
         self.attn_impl_cls = self.attn_backend.get_impl_cls()
         self.attention = self.attn_impl_cls(
             num_heads=num_heads,
@@ -47,6 +70,7 @@ class Attention(nn.Module):
             softmax_scale=softmax_scale,
             causal=causal,
             num_kv_heads=num_kv_heads,
+            backend_kwargs=dict(spec.extra) if spec is not None else None,
         )
         # Instantiate fallback backend for float32 support
         self.sdpa_fallback = SDPABackend.get_impl_cls()(
@@ -56,7 +80,6 @@ class Attention(nn.Module):
             causal=causal,
             num_kv_heads=num_kv_heads,
         )
-        self.backend_pref = None
 
         self.softmax_scale = softmax_scale
         self.scatter_idx = scatter_idx
@@ -71,8 +94,7 @@ class Attention(nn.Module):
 
         try:
             config = get_forward_context().omni_diffusion_config
-            self.backend_pref = config.attention_backend
-            if config.parallel_config.ring_degree > 1:
+            if config is not None and config.parallel_config.ring_degree > 1:
                 self.use_ring = True
                 try:
                     sp_group = get_sp_group()
@@ -138,8 +160,10 @@ class Attention(nn.Module):
     def _run_local_attention(self, query, key, value, attn_metadata):
         if query.dtype == torch.float32:
             logger.warning_once(
-                f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
-                f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
+                "Only SDPA supports float32. Overriding attention backend '%s' (role=%s) to SDPA for dtype=%s.",
+                self._resolved_backend,
+                self.role.value,
+                query.dtype,
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 

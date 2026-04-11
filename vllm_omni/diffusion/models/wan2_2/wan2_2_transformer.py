@@ -24,6 +24,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.role import AttentionRole
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -396,6 +397,7 @@ class WanSelfAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            role=AttentionRole.SELF,
         )
 
     def forward(
@@ -541,6 +543,7 @@ class WanCrossAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             skip_sequence_parallel=True,
+            role=AttentionRole.CROSS,
         )
 
     def forward(

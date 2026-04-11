@@ -1,85 +1,110 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Diffusion attention backend selector.
+
+RFC #2632 P2: per-role dispatch.
+
+Lookup precedence per call:
+    config.per_role[role] → config.default → DIFFUSION_ATTENTION_BACKEND env var
+    → platform default
+
+The platform layer (`current_omni_platform.get_diffusion_attn_backend_cls`)
+encapsulates GPU/arch-specific defaults and validates the selected backend.
+
+We intentionally do **not** wrap this function in `@cache`. The selector only
+runs during model construction (per `Attention.__init__`), not on the forward
+path; caching adds compound-key bookkeeping for `AttentionConfig` (which is
+mutable) without measurable benefit. See `tests/diffusion/attention/
+test_selector_benchmark.py` for the latency baseline.
 """
-Diffusion attention backend selector.
 
-This module provides the interface for selecting diffusion attention backends.
-The actual backend selection logic is delegated to the platform layer
-(vllm_omni.platforms), similar to how vLLM handles attention backend selection.
-
-Usage:
-    from vllm_omni.diffusion.attention.selector import get_attn_backend
-
-    # Get the appropriate backend for current platform
-    backend_cls = get_attn_backend(head_size=64)
-
-    # Or override via environment variable
-    # export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
-"""
+from __future__ import annotations
 
 import importlib
 import os
-from functools import cache
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionBackend,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend
+from vllm_omni.diffusion.attention.role import AttentionRole
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 
 logger = init_logger(__name__)
 
 
 def _load_backend_cls(cls_path: str) -> type[AttentionBackend]:
-    """Load a backend class from its fully qualified path.
-
-    Args:
-        cls_path: Fully qualified class path (e.g.,
-            "vllm_omni.diffusion.attention.backends.sdpa.SDPABackend")
-
-    Returns:
-        The loaded backend class
-    """
-    module_path, class_name = cls_path.rsplit(".", 1)
+    module_path, _, class_name = cls_path.rpartition(".")
+    if not module_path:
+        raise ValueError(f"Invalid backend class path: {cls_path!r}")
     try:
         module = importlib.import_module(module_path)
-        backend_class = getattr(module, class_name)
-        return backend_class
     except ImportError as e:
-        raise ImportError(f"Failed to import module {module_path}: {e}")
+        raise ImportError(f"Failed to import module {module_path}: {e}") from e
+    try:
+        return getattr(module, class_name)
     except AttributeError as e:
-        raise AttributeError(f"Class {class_name} not found in module: {e}")
+        raise AttributeError(f"Class {class_name} not found in {module_path}: {e}") from e
 
 
-@cache
-def get_attn_backend(head_size: int) -> type[AttentionBackend]:
-    """
-    Get attention backend for diffusion models.
-
-    The backend selection is delegated to the current platform
-    (vllm_omni.platforms.current_omni_platform), which selects the
-    appropriate backend based on:
-    1. User override via DIFFUSION_ATTENTION_BACKEND environment variable
-    2. Platform-specific defaults and capabilities
-
-    This is similar to how vLLM's get_attn_backend_cls works, where the
-    platform layer decides which backend to use based on hardware capabilities.
+def get_attn_backend(
+    role: AttentionRole | str | None = None,
+    head_size: int = -1,
+    config: AttentionConfig | None = None,
+) -> tuple[type[AttentionBackend], AttentionSpec]:
+    """Resolve the attention backend for a given (role, config).
 
     Args:
-        head_size: Head size for attention computation (may affect backend selection)
+        role: Role of the attention layer (self / cross / joint / other).
+            ``None`` is treated as "no role-specific lookup" — equivalent to
+            asking only for the default backend.
+        head_size: Head size hint for the platform selector. Use ``-1`` when
+            unknown (e.g. inside a generic helper) — the platform selector
+            already tolerates that today.
+        config: Per-role attention config; usually
+            ``forward_context.omni_diffusion_config.attention``. ``None`` is
+            allowed and means "fall through to platform default".
 
     Returns:
-        The selected attention backend class
+        ``(backend_cls, spec)``: the resolved backend class plus the
+        ``AttentionSpec`` that produced it. Callers feed ``spec.extra`` into
+        ``AttentionImpl(..., backend_kwargs=spec.extra)``. When falling
+        through to the platform default, ``spec`` is
+        ``AttentionSpec(backend="auto", extra={})`` — a sentinel telling
+        callers there is no static spec to forward.
     """
+    # Lazy import: avoids a circular module dependency between data.py
+    # (which defines AttentionConfig) and the platform layer.
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
     from vllm_omni.platforms import current_omni_platform
 
-    # Check environment variable for user override
-    selected_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+    role_key: str | None
+    if role is None:
+        role_key = None
+    elif isinstance(role, AttentionRole):
+        role_key = role.value
+    else:
+        role_key = AttentionRole.coerce(role).value
 
-    # Delegate to platform for backend selection
+    spec: AttentionSpec | None = None
+    if isinstance(config, AttentionConfig):
+        spec = config.get(role_key)
+    elif config is not None:
+        raise TypeError(f"get_attn_backend: config must be AttentionConfig or None, got {type(config).__name__}")
+
+    selected_backend = spec.backend if spec is not None else None
+    if selected_backend is None:
+        # Fall through to env var (lowest-priority default), preserving legacy behavior.
+        selected_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+
     backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
         selected_backend=selected_backend,
         head_size=head_size,
     )
+    backend_cls = _load_backend_cls(backend_cls_path)
 
-    return _load_backend_cls(backend_cls_path)
+    if spec is None:
+        spec = AttentionSpec(backend="auto", extra={})
+    return backend_cls, spec

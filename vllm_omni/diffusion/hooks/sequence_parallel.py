@@ -394,8 +394,15 @@ class SequenceParallelSplitHook(ModelHook):
             # No padding needed
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility
-        attn_backend = get_attn_backend(-1)
+        # Check backend compatibility. We don't know which role this hook is
+        # padding for, so resolve against the config's default backend (or env
+        # var fallback) by passing role=None.
+        attn_cfg = None
+        if is_forward_context_available():
+            ctx_cfg = get_forward_context().omni_diffusion_config
+            if ctx_cfg is not None:
+                attn_cfg = getattr(ctx_cfg, "attention", None)
+        attn_backend, _ = get_attn_backend(role=None, head_size=-1, config=attn_cfg)
         if not attn_backend.supports_attention_mask:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "

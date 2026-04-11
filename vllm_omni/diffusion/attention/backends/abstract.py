@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Generic, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, Generic, TypeVar
 
 import torch
 
@@ -64,13 +64,23 @@ class AttentionMetadata:
     # a replicated tensor among processes appended to the front or rear of value, depends the joint_strategy
     joint_strategy: str = "front"
     # the strategy to joint the query, key, and value, can be "front" or "rear"
+    # RFC #2632: free-form per-step extras for new backends (e.g. block masks).
+    # Existing backends ignore this; new ones may consume keys without changing the
+    # dataclass shape.
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
-    @abstractmethod
+    # RFC #2632 P1: every impl exposes the static backend_kwargs it was
+    # constructed with, populated by the base initializer below. Kept as an
+    # annotation (no class-level default) so subclasses that forget to call
+    # super().__init__ get a clean AttributeError rather than silently
+    # sharing a mutable dict across instances.
+    _backend_kwargs: dict[str, Any]
+
     def __init__(
         self,
         num_heads: int,
@@ -79,9 +89,19 @@ class AttentionImpl(ABC, Generic[T]):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        backend_kwargs: dict[str, Any] | None = None,
         **extra_impl_args,
     ) -> None:
-        raise NotImplementedError
+        # Concrete base initializer: stores common state and the static
+        # `backend_kwargs` dict so backends and tests can introspect it.
+        # Subclasses may still override and call `super().__init__(...)`.
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.softmax_scale = softmax_scale
+        self.causal = causal
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.prefix = prefix
+        self._backend_kwargs = dict(backend_kwargs) if backend_kwargs else {}
 
     def forward(
         self,

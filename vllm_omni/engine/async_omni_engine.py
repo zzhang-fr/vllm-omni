@@ -87,10 +87,28 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _normalize_attention_kwarg(value: Any) -> Any:
+    """Coerce an ``attention=`` kwarg into a shape OmegaConf can store.
+
+    ``OmniDiffusionConfig.__post_init__`` downstream handles dict/str/None
+    (and ``AttentionConfig``) uniformly. This helper exists specifically for
+    the YAML-stage-config override path: assigning a live ``AttentionConfig``
+    dataclass into an ``OmegaConf.DictConfig`` leaf would fail, so we
+    eagerly flatten it to a plain dict here.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, dict)):
+        return value
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    return value
+
+
 def _patch_generation_config_if_needed(model_config: Any) -> None:
     """Ensure try_get_generation_config won't crash for models whose HF
     config.json lacks model_type (e.g. CosyVoice3). We probe it once;
-    if it raises, we monkey-patch the method to return None."""
+    if it raises, we monkey-patch it to return None."""
     try:
         model_config.try_get_generation_config()
     except Exception:
@@ -1194,6 +1212,12 @@ class AsyncOmniEngine:
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            # RFC #2632: per-role attention backend selection. Accepts an
+            # AttentionConfig, dict, str, or None. OmniDiffusionConfig.__post_init__
+            # normalizes it. The legacy `attention_backend: str` field is also
+            # forwarded so existing callers continue to work.
+            "attention": _normalize_attention_kwarg(kwargs.get("attention")),
+            "attention_backend": kwargs.get("attention_backend"),
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
@@ -1268,6 +1292,19 @@ class AsyncOmniEngine:
                         or cfg.engine_args.quantization_config is None
                     ):
                         cfg.engine_args.quantization_config = quantization_config
+                # RFC #2632: per-role attention backend selection. The kwarg may
+                # be an AttentionConfig, dict, or string-form CLI spec. Flatten
+                # dataclasses to dict here so OmegaConf can store them; the
+                # downstream OmniDiffusionConfig.__post_init__ normalizes the
+                # final shape. Only override when the YAML didn't already set it.
+                attention = _normalize_attention_kwarg(kwargs.get("attention"))
+                if attention is not None:
+                    if not hasattr(cfg.engine_args, "attention") or cfg.engine_args.attention is None:
+                        cfg.engine_args.attention = attention
+                attention_backend = kwargs.get("attention_backend")
+                if attention_backend is not None:
+                    if not hasattr(cfg.engine_args, "attention_backend") or cfg.engine_args.attention_backend is None:
+                        cfg.engine_args.attention_backend = attention_backend
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 
