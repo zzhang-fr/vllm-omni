@@ -51,8 +51,15 @@ class SageAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        self.causal = causal
-        self.softmax_scale = softmax_scale
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            backend_kwargs=extra_impl_args.get("backend_kwargs"),
+        )
 
     def forward_cuda(
         self,

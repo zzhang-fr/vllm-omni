@@ -4,7 +4,7 @@
 
 Tests:
 - WanSelfAttention no longer has sparse_attn attribute
-- WanCrossAttention passes is_self_attention=False
+- WanCrossAttention passes role=AttentionRole.CROSS
 - Sparse attention is now handled via the attention backend layer
 """
 
@@ -33,6 +33,7 @@ def _mock_distributed():
 
     mock_config = MagicMock()
     mock_config.attention_backend = None
+    mock_config.attention = None
     mock_config.parallel_config.ring_degree = 1
     mock_ctx = stack.enter_context(patch("vllm_omni.diffusion.attention.layer.get_forward_context"))
     mock_ctx.return_value.omni_diffusion_config = mock_config
@@ -62,8 +63,8 @@ class TestWanSelfAttentionNoSparseAttr:
         assert not hasattr(attn, "sparse_attn")
 
 
-class TestWanCrossAttentionIsSelfAttention:
-    """Test that WanCrossAttention passes is_self_attention=False."""
+class TestWanCrossAttentionRole:
+    """Test that WanCrossAttention passes role=AttentionRole.CROSS."""
 
     def _make_cross_attn(self):
         with _mock_distributed():
@@ -73,16 +74,15 @@ class TestWanCrossAttentionIsSelfAttention:
 
             return WanCrossAttention(dim=512, num_heads=8, head_dim=64)
 
-    def test_cross_attn_is_self_attention_false(self):
+    def test_cross_attn_role_is_cross(self):
         """Verify the Attention layer in WanCrossAttention was constructed
-        with is_self_attention=False. The impl should have received it."""
+        with role=AttentionRole.CROSS."""
+        from vllm_omni.diffusion.attention.role import AttentionRole
+
         cross_attn = self._make_cross_attn()
-        # The underlying attention impl should have received is_self_attention
-        # through extra_impl_args. We can check if the impl was constructed
-        # with is_self_attention=False by checking the Attention's construction.
-        # For sparse_attention backend this means _sparse_impl would be None.
-        # For other backends this is a no-op (they ignore the kwarg).
+        # The Attention layer should have role=AttentionRole.CROSS
         assert cross_attn.attn is not None
+        assert cross_attn.attn.role == AttentionRole.CROSS
 
 
 class TestNoEnableSparseAttention:

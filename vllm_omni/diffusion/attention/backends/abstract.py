@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Generic, TypeVar
+from dataclasses import dataclass, field
+from typing import Any, Generic, TypeVar
 
 import torch
 
@@ -55,6 +55,7 @@ class AttentionBackend(ABC):
 class AttentionMetadata:
     attn_mask: torch.Tensor | None = None
     joint_attn_mask: torch.Tensor | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
     # a joint mask for the joint query, key, and value, depends the joint_strategy
     joint_query: torch.Tensor | None = None
     # a replicated tensor among processes appended to the front or rear of query, depends the joint_strategy
@@ -70,7 +71,6 @@ T = TypeVar("T", bound=AttentionMetadata)
 
 
 class AttentionImpl(ABC, Generic[T]):
-    @abstractmethod
     def __init__(
         self,
         num_heads: int,
@@ -79,9 +79,16 @@ class AttentionImpl(ABC, Generic[T]):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        backend_kwargs: dict[str, Any] | None = None,
         **extra_impl_args,
     ) -> None:
-        raise NotImplementedError
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.softmax_scale = softmax_scale
+        self.causal = causal
+        self.num_kv_heads = num_kv_heads
+        self.prefix = prefix
+        self._backend_kwargs: dict[str, Any] = backend_kwargs or {}
 
     def forward(
         self,

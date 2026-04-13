@@ -30,6 +30,95 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass
+class AttentionSpec:
+    """Specification for a single attention backend (name + extra kwargs)."""
+
+    backend: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def coerce(cls, value: "str | dict[str, Any] | AttentionSpec") -> "AttentionSpec":
+        """Accept str (just backend name), dict, or AttentionSpec."""
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(backend=value)
+        if isinstance(value, dict):
+            backend = value.get("backend", "")
+            extra = {k: v for k, v in value.items() if k != "backend"}
+            return cls(backend=backend, extra=extra)
+        raise TypeError(f"Cannot coerce {type(value).__name__} to AttentionSpec")
+
+
+@dataclass
+class AttentionConfig:
+    """Per-role attention backend configuration.
+
+    Holds an optional default spec and per-role overrides.
+    """
+
+    default: AttentionSpec | None = None
+    per_role: dict[str, AttentionSpec] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AttentionConfig":
+        """Build from a dict, e.g. {"default": "FLASH_ATTN", "per_role": {"self": "SAGE_ATTN"}}."""
+        default = data.get("default")
+        default_spec = AttentionSpec.coerce(default) if default is not None else None
+        per_role: dict[str, AttentionSpec] = {}
+        for role_name, spec_val in data.get("per_role", {}).items():
+            from vllm_omni.diffusion.attention.role import AttentionRole
+
+            AttentionRole.coerce(role_name)  # validate
+            per_role[role_name.lower()] = AttentionSpec.coerce(spec_val)
+        return cls(default=default_spec, per_role=per_role)
+
+    @classmethod
+    def from_legacy(cls, attention_backend: str | None) -> "AttentionConfig":
+        """Wrap a scalar backend name into an AttentionConfig with only a default."""
+        if attention_backend is None:
+            return cls()
+        return cls(default=AttentionSpec(backend=attention_backend))
+
+    @classmethod
+    def parse_cli(cls, value: str) -> "AttentionConfig":
+        """Parse CLI-style strings.
+
+        Single backend:  "FLASH_ATTN"  -> default=AttentionSpec(backend="FLASH_ATTN")
+        Per-role:        "self=SAGE_ATTN,cross=FLASH_ATTN"
+        """
+        from vllm_omni.diffusion.attention.role import AttentionRole
+
+        value = value.strip()
+        if not value:
+            return cls()
+        if "=" not in value:
+            return cls(default=AttentionSpec(backend=value))
+        per_role: dict[str, AttentionSpec] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                raise ValueError(
+                    f"Invalid per-role attention spec: {pair!r}. Expected 'role=backend'."
+                )
+            role_str, backend = pair.split("=", 1)
+            AttentionRole.coerce(role_str)  # validate
+            per_role[role_str.strip().lower()] = AttentionSpec(backend=backend.strip())
+        return cls(per_role=per_role)
+
+    def get(self, role: str | None = None) -> AttentionSpec | None:
+        """Lookup per_role[role], falling back to default."""
+        if role is not None:
+            spec = self.per_role.get(role.lower())
+            if spec is not None:
+                return spec
+        return self.default
+
+    def is_empty(self) -> bool:
+        return self.default is None and not self.per_role
+
+
 @config
 @dataclass
 class DiffusionParallelConfig:
@@ -405,6 +494,7 @@ class OmniDiffusionConfig:
 
     # Attention
     attention_backend: str | None = None
+    attention: "AttentionConfig | dict[str, Any] | str | None" = None
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -659,6 +749,14 @@ class OmniDiffusionConfig:
         # Convert sparse_attn dict to DiffusionSparseAttnConfig if needed
         if isinstance(self.sparse_attn, dict):
             self.sparse_attn = DiffusionSparseAttnConfig.from_dict(self.sparse_attn)
+
+        # Normalize attention field to AttentionConfig
+        if isinstance(self.attention, dict):
+            self.attention = AttentionConfig.from_dict(self.attention)
+        elif isinstance(self.attention, str):
+            self.attention = AttentionConfig.parse_cli(self.attention)
+        elif self.attention is None and self.attention_backend is not None:
+            self.attention = AttentionConfig.from_legacy(self.attention_backend)
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction

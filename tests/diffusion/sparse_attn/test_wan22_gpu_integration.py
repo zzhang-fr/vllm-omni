@@ -24,7 +24,7 @@ requires_gpu = pytest.mark.skipif(not _has_cuda, reason="Requires CUDA GPU")
 class TestSparseAttentionImplGPU:
     """Test _SparseAttentionImpl forward on GPU with plugin detection."""
 
-    def _make_impl(self, sparse_cfg=None, is_self_attention=True):
+    def _make_impl(self, sparse_cfg=None, role="self"):
         """Create a _SparseAttentionImpl with mocked forward context."""
         from vllm_omni.diffusion.attention.backends.sparse_attention import _SparseAttentionImpl
 
@@ -38,7 +38,7 @@ class TestSparseAttentionImplGPU:
                 softmax_scale=64**-0.5,
                 causal=False,
                 num_kv_heads=4,
-                is_self_attention=is_self_attention,
+                backend_kwargs={"role": role},
             )
 
     def test_dense_fallback_forward(self):
@@ -52,9 +52,9 @@ class TestSparseAttentionImplGPU:
         assert not torch.isnan(out).any()
 
     def test_cross_attention_always_dense(self):
-        """Cross-attention (is_self_attention=False) ignores sparse config."""
+        """Cross-attention (role='cross') ignores sparse config."""
         cfg = DiffusionSparseAttnConfig(backend="auto", params={"topk": 0.3})
-        impl = self._make_impl(sparse_cfg=cfg, is_self_attention=False)
+        impl = self._make_impl(sparse_cfg=cfg, role="cross")
         q = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
         k = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
         v = torch.randn(1, 64, 4, 64, dtype=torch.bfloat16, device="cuda")
@@ -65,7 +65,7 @@ class TestSparseAttentionImplGPU:
         """Self-attention with a mock sparse function."""
 
         # Create impl with no sparse config (dense)
-        impl = self._make_impl(sparse_cfg=None, is_self_attention=True)
+        impl = self._make_impl(sparse_cfg=None, role="self")
 
         # Inject a mock sparse function that uses SDPA
         def fake_sparse_fn(q, k, v, params, is_causal):

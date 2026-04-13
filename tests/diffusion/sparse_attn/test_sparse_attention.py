@@ -4,11 +4,11 @@
 
 Tests:
 - SparseAttentionBackend inherits AttentionBackend
-- _SparseAttentionImpl cross-attention path (is_self_attention=False -> dense)
+- _SparseAttentionImpl cross-attention path (role="cross" -> dense)
 - _SparseAttentionImpl self-attention with no sparse config -> dense
 - Function-based plugin resolution (entry points, import path)
 - SPARSE_ATTENTION enum registration
-- is_self_attention parameter in Attention layer
+- role parameter in Attention layer
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class TestSparseAttentionBackendInheritance:
 
 
 class TestSparseAttentionImplCrossAttention:
-    """Test _SparseAttentionImpl with is_self_attention=False always uses dense."""
+    """Test _SparseAttentionImpl with role='cross' always uses dense."""
 
     def test_cross_attn_uses_dense(self):
         impl = _SparseAttentionImpl(
@@ -60,21 +60,21 @@ class TestSparseAttentionImplCrossAttention:
             head_size=64,
             softmax_scale=0.125,
             causal=False,
-            is_self_attention=False,
+            backend_kwargs={"role": "cross"},
         )
-        assert impl._is_self_attention is False
+        assert impl._is_cross_attention is True
         assert impl._sparse_fn is None
         assert impl._dense is not None
 
-    def test_self_attn_default_true(self):
-        """Default is_self_attention=True."""
+    def test_self_attn_default(self):
+        """Default role='self', so _is_cross_attention is False."""
         impl = _SparseAttentionImpl(
             num_heads=8,
             head_size=64,
             softmax_scale=0.125,
             causal=False,
         )
-        assert impl._is_self_attention is True
+        assert impl._is_cross_attention is False
 
     def test_self_attn_no_config_falls_back_to_dense(self):
         """When no sparse config is available, self-attention also uses dense."""
@@ -83,7 +83,7 @@ class TestSparseAttentionImplCrossAttention:
             head_size=64,
             softmax_scale=0.125,
             causal=False,
-            is_self_attention=True,
+            backend_kwargs={"role": "self"},
         )
         # Without forward context, _read_sparse_cfg returns None -> no plugin loaded
         assert impl._sparse_fn is None
@@ -144,8 +144,8 @@ class TestEntryPointsPluginLookup:
         assert result is mock_backend_cls
 
 
-class TestIsSelfattentionInAttentionLayer:
-    """Test that Attention layer passes is_self_attention to impl."""
+class TestRoleInAttentionLayer:
+    """Test that Attention layer passes role to impl."""
 
     def _mock_distributed(self):
         from contextlib import ExitStack
@@ -162,6 +162,7 @@ class TestIsSelfattentionInAttentionLayer:
 
         mock_config = MagicMock()
         mock_config.attention_backend = None
+        mock_config.attention = None
         mock_config.parallel_config.ring_degree = 1
         mock_ctx = stack.enter_context(patch("vllm_omni.diffusion.attention.layer.get_forward_context"))
         mock_ctx.return_value.omni_diffusion_config = mock_config
@@ -173,8 +174,8 @@ class TestIsSelfattentionInAttentionLayer:
         )
         return stack
 
-    def test_default_is_self_attention_true(self):
-        """By default, Attention sets is_self_attention=True."""
+    def test_default_role_self(self):
+        """By default, Attention sets role=AttentionRole.SELF."""
         with self._mock_distributed():
             from vllm_omni.diffusion.attention.layer import Attention
 
@@ -187,17 +188,18 @@ class TestIsSelfattentionInAttentionLayer:
             # The impl was constructed — no crash means it accepted the kwarg
             assert attn.attention is not None
 
-    def test_is_self_attention_false_accepted(self):
-        """Attention(is_self_attention=False) works."""
+    def test_role_cross_accepted(self):
+        """Attention(role=AttentionRole.CROSS) works."""
         with self._mock_distributed():
             from vllm_omni.diffusion.attention.layer import Attention
+            from vllm_omni.diffusion.attention.role import AttentionRole
 
             attn = Attention(
                 num_heads=8,
                 head_size=64,
                 causal=False,
                 softmax_scale=0.125,
-                is_self_attention=False,
+                role=AttentionRole.CROSS,
             )
             assert attn.attention is not None
 

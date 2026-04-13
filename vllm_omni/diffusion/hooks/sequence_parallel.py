@@ -395,7 +395,7 @@ class SequenceParallelSplitHook(ModelHook):
             return sp_shard(x, dim, validate=False)
 
         # Check backend compatibility
-        attn_backend = get_attn_backend(-1)
+        attn_backend = get_attn_backend(head_size=-1)
         if not attn_backend.supports_attention_mask:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "

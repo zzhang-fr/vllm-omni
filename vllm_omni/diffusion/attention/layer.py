@@ -16,6 +16,7 @@ from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.parallel.ring import RingParallelAttention
+from vllm_omni.diffusion.attention.role import AttentionRole
 from vllm_omni.diffusion.attention.selector import get_attn_backend
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -37,10 +38,29 @@ class Attention(nn.Module):
         gather_idx: int = 1,
         use_sync: bool = False,
         skip_sequence_parallel: bool = False,
-        is_self_attention: bool = True,
+        role: "AttentionRole | str" = AttentionRole.SELF,
     ):
         super().__init__()
-        self.attn_backend = get_attn_backend(-1)
+        self.role = AttentionRole.coerce(role) if isinstance(role, str) else role
+
+        # Resolve per-role attention config from forward context (if available)
+        attn_cfg = None
+        try:
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                ctx_cfg = getattr(ctx, 'omni_diffusion_config', None)
+                if ctx_cfg is not None:
+                    attn_cfg = getattr(ctx_cfg, 'attention', None)
+        except (AttributeError, AssertionError):
+            pass
+
+        backend_cls, spec = get_attn_backend(
+            head_size=head_size, role=str(self.role), config=attn_cfg,
+        )
+        self._resolved_backend = spec.backend
+        backend_kwargs = {"role": str(self.role), **spec.extra}
+
+        self.attn_backend = backend_cls
         self.attn_impl_cls = self.attn_backend.get_impl_cls()
         self.attention = self.attn_impl_cls(
             num_heads=num_heads,
@@ -48,7 +68,7 @@ class Attention(nn.Module):
             softmax_scale=softmax_scale,
             causal=causal,
             num_kv_heads=num_kv_heads,
-            is_self_attention=is_self_attention,
+            backend_kwargs=backend_kwargs,
         )
         # Instantiate fallback backend for float32 support
         self.sdpa_fallback = SDPABackend.get_impl_cls()(

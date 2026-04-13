@@ -3,9 +3,10 @@
 """Built-in dispatcher backend for DiT sparse attention.
 
 Selected via --attn-backend sparse_attention.
-Reads is_self_attention (from Attention.__init__ extra_impl_args):
-  - False -> SDPA fallback, zero overhead on cross-attention
-  - True  -> look up sparse attention function from plugin
+Uses the ``role`` key from ``backend_kwargs`` (set by
+:class:`~vllm_omni.diffusion.attention.layer.Attention`):
+  - role != "self" -> SDPA fallback, zero overhead on non-self attention
+  - role == "self" -> look up sparse attention function plugin
 
 Plugin resolution in self-attention path:
   1. sparse_attn.backend == "auto" -> first available in vllm_omni.sparse_attn EP group
@@ -81,13 +82,19 @@ class _SparseAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        self._num_heads = num_heads
-        self._head_size = head_size
-        self._softmax_scale = softmax_scale
-        self._causal = causal
-        self._is_self_attention: bool = extra_impl_args.get("is_self_attention", True)
+        super().__init__(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            num_kv_heads=num_kv_heads,
+            prefix=prefix,
+            backend_kwargs=extra_impl_args.get("backend_kwargs"),
+        )
+        _role = self._backend_kwargs.get("role", "self")
+        self._is_cross_attention: bool = (_role != "self")
 
-        # Dense fallback (used for cross-attention, or when no plugin found)
+        # Dense fallback (used for non-self attention, or when no plugin found)
         self._dense = SDPABackend.get_impl_cls()(
             num_heads=num_heads,
             head_size=head_size,
@@ -100,8 +107,8 @@ class _SparseAttentionImpl(AttentionImpl):
         self._sparse_fn: SparseAttnFn | None = None
         self._params: dict = {}
 
-        if not self._is_self_attention:
-            return  # cross-attention: always dense, done
+        if self._is_cross_attention:
+            return  # non-self attention: always dense, done
 
         cfg = self._read_sparse_cfg()
         if cfg is None or cfg.backend in ("none", "dense"):
@@ -134,7 +141,7 @@ class _SparseAttentionImpl(AttentionImpl):
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
 
-        out = self._sparse_fn(q, k, v, self._params, self._causal)
+        out = self._sparse_fn(q, k, v, self._params, self.causal)
 
         # (B, H, S, D) -> (B, S, H, D)
         return out.transpose(1, 2)
