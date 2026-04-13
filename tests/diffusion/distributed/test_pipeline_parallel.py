@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import socket
 
 import pytest
 import torch
@@ -20,8 +21,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pp_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.platforms import current_omni_platform
 
-DIST_PORT = "29500"
-BASELINE_PORT = "29501"
+
+def _find_free_port() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return str(s.getsockname()[1])
 
 
 def update_environment_variables(envs_dict: dict[str, str]) -> None:
@@ -274,8 +278,8 @@ def make_pipeline_and_inputs(
 # ---------------------------------------------------------------------------
 
 
-def isend_irecv_worker(local_rank: int, world_size: int, result_queue):
-    device = init_dist(local_rank, world_size, DIST_PORT)
+def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, result_queue):
+    device = init_dist(local_rank, world_size, master_port)
     initialize_model_parallel(pipeline_parallel_size=world_size)
     pp_group = get_pp_group()
 
@@ -303,7 +307,8 @@ def test_isend_irecv_tensor_dict(pp_size: int):
     manager = mp_context.Manager()
     q = manager.Queue()
 
-    torch.multiprocessing.spawn(isend_irecv_worker, args=(pp_size, q), nprocs=pp_size)
+    port = _find_free_port()
+    torch.multiprocessing.spawn(isend_irecv_worker, args=(pp_size, port, q), nprocs=pp_size)
 
     results = {label: tensor for label, tensor in [q.get(), q.get()]}
     torch.testing.assert_close(
@@ -337,7 +342,7 @@ def compute_single_gpu_baseline(test_config: dict, dtype: torch.dtype, do_true_c
     if key in _baseline_cache:
         return _baseline_cache[key]
 
-    device = init_dist(0, 1, BASELINE_PORT)
+    device = init_dist(0, 1, _find_free_port())
     initialize_model_parallel(pipeline_parallel_size=1)
 
     pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
@@ -483,9 +488,10 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
     pp_q = manager.Queue()
 
     world_size = pp_size * cfg_size
+    port = _find_free_port()
     torch.multiprocessing.spawn(
         predict_noise_worker,
-        args=(world_size, DIST_PORT, pp_size, cfg_size, do_true_cfg, dtype, test_config, pp_q),
+        args=(world_size, port, pp_size, cfg_size, do_true_cfg, dtype, test_config, pp_q),
         nprocs=world_size,
     )
 
@@ -506,8 +512,8 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
 # ---------------------------------------------------------------------------
 
 
-def scheduler_step_pp2_worker(local_rank: int, world_size: int, test_config: dict, result_queue):
-    device = init_dist(local_rank, world_size, DIST_PORT)
+def scheduler_step_pp2_worker(local_rank: int, world_size: int, master_port: str, test_config: dict, result_queue):
+    device = init_dist(local_rank, world_size, master_port)
     initialize_model_parallel(pipeline_parallel_size=world_size)
 
     pp_group = get_pp_group()
@@ -551,9 +557,10 @@ def test_scheduler_step_pp2():
     manager = mp_context.Manager()
     q = manager.Queue()
 
+    port = _find_free_port()
     torch.multiprocessing.spawn(
         scheduler_step_pp2_worker,
-        args=(2, {"num_layers": 4, "dim": 64, "batch_size": 2, "model_seed": 42, "input_seed": 300}, q),
+        args=(2, port, {"num_layers": 4, "dim": 64, "batch_size": 2, "model_seed": 42, "input_seed": 300}, q),
         nprocs=2,
     )
 
