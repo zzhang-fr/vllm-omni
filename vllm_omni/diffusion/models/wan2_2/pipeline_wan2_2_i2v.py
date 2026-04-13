@@ -21,7 +21,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.pp_parallel import PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pp_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -588,6 +588,8 @@ class Wan22I2VPipeline(
             _t_decode_start = time.perf_counter()
 
         if output_type == "latent":
+            if isinstance(latents, AsyncLatents):
+                latents = torch.as_tensor(latents)  # avoid copying
             output = latents
         else:
             latents = latents.to(self.vae.dtype)

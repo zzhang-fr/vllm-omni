@@ -155,6 +155,13 @@ class TestAsyncLatents:
         result = torch.cat([al, al], dim=0)
         torch.testing.assert_close(result, torch.cat([t, t], dim=0))
 
+    def test_torch_tensor_conversion(self):
+        """torch.as_tensor on an AsyncLatents must share storage with the underlying tensor (no copy)."""
+        t = torch.randn(2, 4)
+        al = self._make(t)
+        result = torch.as_tensor(al)
+        assert result.data_ptr() == t.data_ptr(), "torch.as_tensor copied the data instead of sharing storage"
+
     def test_handles_are_waited_before_resolve(self):
         t = torch.randn(2, 4)
         h1, h2 = FakeWork(), FakeWork()
@@ -396,9 +403,10 @@ def predict_noise_worker(
         )
     pipeline.sync_pp_send()
 
-    if pp_group.is_last_rank and cfg_rank == 0:
+    if pp_group.is_last_rank:
         assert noise_pred is not None
-        result_queue.put(noise_pred.cpu())
+        if cfg_rank == 0:
+            result_queue.put(noise_pred.cpu())
     else:
         assert noise_pred is None
 
@@ -508,68 +516,130 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
 
 
 # ---------------------------------------------------------------------------
-# 5.  scheduler_step_maybe_with_pp_and_cfg  (PP=2)
+# 5.  scheduler_step_maybe_with_pp_and_cfg
 # ---------------------------------------------------------------------------
 
 
-def scheduler_step_pp2_worker(local_rank: int, world_size: int, master_port: str, test_config: dict, result_queue):
-    device = init_dist(local_rank, world_size, master_port)
-    initialize_model_parallel(pipeline_parallel_size=world_size)
+def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool) -> torch.Tensor:
+    """Single-GPU reference: predict_noise + scheduler_step."""
+    device = init_dist(0, 1, _find_free_port())
+    initialize_model_parallel(pipeline_parallel_size=1)
 
-    pp_group = get_pp_group()
-
-    pipeline, positive_kwargs, _ = make_pipeline_and_inputs(test_config, torch.float32, device)
+    pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
+        test_config, torch.float32, device, do_true_cfg=do_true_cfg
+    )
     latents = positive_kwargs["x"]
-
-    # Only the last rank has a noise prediction; middle / first ranks pass None.
-    noise_pred = None
-    if pp_group.is_last_rank:
-        torch.manual_seed(test_config["input_seed"] + 10)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(test_config["input_seed"] + 10)
-        noise_pred = torch.randn_like(latents)
-
     t = torch.tensor(500, device=device)
 
     with torch.inference_mode():
-        result = pipeline.scheduler_step_maybe_with_pp_and_cfg(
-            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=False
+        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+            do_true_cfg=do_true_cfg,
+            true_cfg_scale=test_config["cfg_scale"],
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
         )
-    # Last rank must flush pending isend before the process exits.
+        result = pipeline.scheduler_step_maybe_with_pp_and_cfg(
+            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
+        )
+
+    destroy_distributed_env()
+    return result.cpu()
+
+
+def scheduler_step_worker(
+    local_rank: int,
+    world_size: int,
+    master_port: str,
+    pp_size: int,
+    cfg_size: int,
+    do_true_cfg: bool,
+    test_config: dict,
+    result_queue,
+):
+    device = init_dist(local_rank, world_size, master_port)
+    initialize_model_parallel(pipeline_parallel_size=pp_size, cfg_parallel_size=cfg_size)
+
+    pp_group = get_pp_group()
+    cfg_rank = get_classifier_free_guidance_rank()
+
+    pipeline, positive_kwargs, negative_kwargs = make_pipeline_and_inputs(
+        test_config, torch.float32, device, do_true_cfg=do_true_cfg
+    )
+    latents = positive_kwargs["x"]
+    t = torch.tensor(500, device=device)
+
+    with torch.inference_mode():
+        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+            do_true_cfg=do_true_cfg,
+            true_cfg_scale=test_config["cfg_scale"],
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+        latents = pipeline.scheduler_step_maybe_with_pp_and_cfg(
+            noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
+        )
     pipeline.sync_pp_send()
 
-    if pp_group.is_last_rank:
-        # result is the scheduler-updated tensor
-        result_queue.put(("last", result.cpu()))
-    elif pp_group.is_first_rank:
-        # result is AsyncLatents; resolve it by forcing a torch operation
-        resolved = result.contiguous()
-        result_queue.put(("first", resolved.cpu()))
+    if pp_group.is_first_rank and cfg_rank == 0:
+        resolved = latents.contiguous()
+        result_queue.put(resolved.cpu())
 
     destroy_distributed_env()
 
 
-@pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs")
-def test_scheduler_step_pp2():
-    """Rank 0 receives the exact latent tensor produced by the last PP rank via AsyncLatents."""
+@pytest.mark.parametrize(
+    "pp_size, cfg_size, do_true_cfg, input_seed",
+    [
+        pytest.param(
+            2,
+            1,
+            False,
+            300,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
+            id="pp2-no_cfg",
+        ),
+        pytest.param(
+            2,
+            2,
+            True,
+            600,
+            marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 4, reason="Need at least 4 GPUs"),
+            id="pp2-cfg2-true_cfg",
+        ),
+    ],
+)
+def test_scheduler_step(pp_size, cfg_size, do_true_cfg, input_seed):
+    """Rank 0 latents after scheduler_step match the single-GPU baseline across PP / CFG topologies."""
+    test_config = {
+        "num_layers": 4,
+        "dim": 64,
+        "batch_size": 2,
+        "cfg_scale": 7.5,
+        "model_seed": 42,
+        "input_seed": input_seed,
+    }
+
+    baseline = compute_scheduler_step_baseline(test_config, do_true_cfg)
 
     mp_context = torch.multiprocessing.get_context("spawn")
     manager = mp_context.Manager()
     q = manager.Queue()
 
     port = _find_free_port()
+    world_size = pp_size * cfg_size
     torch.multiprocessing.spawn(
-        scheduler_step_pp2_worker,
-        args=(2, port, {"num_layers": 4, "dim": 64, "batch_size": 2, "model_seed": 42, "input_seed": 300}, q),
-        nprocs=2,
+        scheduler_step_worker,
+        args=(world_size, port, pp_size, cfg_size, do_true_cfg, test_config, q),
+        nprocs=world_size,
     )
 
-    items = {label: tensor for label, tensor in [q.get(), q.get()]}
-    assert "first" in items and "last" in items, "Expected results from both PP ranks; got keys: " + str(set(items))
+    result = q.get()
     torch.testing.assert_close(
-        items["first"],
-        items["last"],
+        result,
+        baseline,
         rtol=0,
         atol=0,
-        msg="AsyncLatents on rank 0 does not match the tensor computed on the last PP rank",
+        msg=f"PP={pp_size} CFG={cfg_size} scheduler step latents on rank 0 do not match single-GPU baseline",
     )

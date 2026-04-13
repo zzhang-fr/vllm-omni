@@ -145,7 +145,7 @@ class PipelineParallelMixin:
           - PP only, no CFG: cond branch only.
 
         Returns:
-            noise_pred on the last PP rank (and only on CFG rank 0 when CFG-parallel is active).
+            noise_pred on the last PP rank (all CFG ranks when CFG-parallel is active).
             None on all other ranks.
         """
         if get_pipeline_parallel_world_size() == 1:
@@ -183,15 +183,13 @@ class PipelineParallelMixin:
         noise_preds = [self.predict_noise(**kwargs, intermediate_tensors=it) for kwargs, it in zip(all_kwargs, its)]
 
         if cfg_parallel_ready:
-            # All-gather the single-branch prediction across the CFG group so that
-            # the positive and negative predictions are available on all CFG ranks.
+            # All-gather the single-branch prediction across the CFG group and combine
+            # on all CFG ranks so every last PP rank has an identical noise_pred.
             local_pred = noise_preds[0]
             if output_slice is not None:
                 local_pred = local_pred[:, :output_slice]
             gathered = get_cfg_group().all_gather(local_pred, separate_tensors=True)
-            if get_classifier_free_guidance_rank() == 0:
-                return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
-            return None
+            return self.combine_cfg_noise(gathered[0], gathered[1], true_cfg_scale, cfg_normalize)
 
         # Sequential CFG or no-CFG path.
         if do_true_cfg:
