@@ -73,9 +73,11 @@ This asynchronous design avoids unnecessary blocking between denoising steps.
 
 ## Step-by-Step Implementation
 
-### Step 1: Inherit `PipelineParallelMixin`
+### Step 1: Inherit `PipelineParallelMixin` and `CFGParallelMixin`
 
-Allow your pipeline to inherit from `PipelineParallelMixin`. In practice, most diffusion pipelines that support PP will also inherit `CFGParallelMixin`, because `PipelineParallelMixin` delegates to CFG helpers when PP is disabled and can combine with CFG when PP is enabled.
+`PipelineParallelMixin` **requires** `CFGParallelMixin`. This is enforced at class definition time via `__init_subclass__`: defining a pipeline that inherits `PipelineParallelMixin` without `CFGParallelMixin` raises a `TypeError` immediately on import.
+
+`PipelineParallelMixin` delegates noise prediction, CFG combination, and scheduler stepping to `CFGParallelMixin`, which supplies `predict_noise()`, `predict_noise_maybe_with_cfg()`, `scheduler_step_maybe_with_cfg()`, and `combine_cfg_noise()`.
 
 **Example (Wan2.2):**
 
@@ -323,6 +325,26 @@ python examples/offline_inference/text_to_video/text_to_video.py \
 ---
 
 ## Troubleshooting
+
+### Issue: `TypeError` on import — `CFGParallelMixin` missing
+
+**Symptoms:** Importing a pipeline that inherits `PipelineParallelMixin` raises:
+
+```
+TypeError: YourPipeline inherits PipelineParallelMixin but not CFGParallelMixin.
+```
+
+**Cause:** `PipelineParallelMixin` enforces via `__init_subclass__` that the subclass also inherits `CFGParallelMixin`.
+
+**Solution:** Add `CFGParallelMixin` to the pipeline's base classes:
+
+```python
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pp_parallel import PipelineParallelMixin
+
+class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin):
+    ...
+```
 
 ### Issue: PP run hangs before decode or later collectives
 

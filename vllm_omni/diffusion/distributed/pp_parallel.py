@@ -90,6 +90,18 @@ class PipelineParallelMixin:
     PP stage operates on the correct encoder_hidden_states.
     """
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+
+        if not issubclass(cls, CFGParallelMixin):
+            raise TypeError(
+                f"{cls.__name__} inherits PipelineParallelMixin but not CFGParallelMixin. "
+                "Pipeline Parallelism requires CFGParallelMixin for predict_noise(), "
+                "predict_noise_maybe_with_cfg(), scheduler_step_maybe_with_cfg(), and combine_cfg_noise(). "
+                "Add CFGParallelMixin to the base classes of your pipeline."
+            )
+
     @property
     def _pp_send_work(self) -> list[torch.distributed.Work]:
         if not hasattr(self, "_pp_send_work_list"):
