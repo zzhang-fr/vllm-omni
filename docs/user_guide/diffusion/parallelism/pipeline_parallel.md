@@ -110,13 +110,13 @@ vllm serve Wan-AI/Wan2.2-TI2V-5B-Diffusers --omni --port 8091 \
 
 In `DiffusionParallelConfig`
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pipeline_parallel_size` | int | 1 | Number of pipeline-parallel stages. Set to a value greater than 1 to split the denoising transformer across GPUs |
+| Parameter                | Type | Default | Description                                                                                                      |
+|--------------------------|------|---------|------------------------------------------------------------------------------------------------------------------|
+| `pipeline_parallel_size` | int  | 1       | Number of pipeline-parallel stages. Set to a value greater than 1 to split the denoising transformer across GPUs |
 
 
-!!! info
-    Total GPU count is the product of all enabled distributed dimensions, for example `pipeline_parallel_size * cfg_parallel_size * tensor_parallel_size * ulysses_degree * ring_degree`.
+> [!NOTE]
+> Total GPU count is the product of all enabled distributed dimensions, for example `pipeline_parallel_size * cfg_parallel_size * tensor_parallel_size * ulysses_degree * ring_degree`.
 
 
 ---
