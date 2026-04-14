@@ -83,12 +83,12 @@ This asynchronous design avoids unnecessary blocking between denoising steps.
 
 ```python
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.pp_parallel import PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 import torch.nn as nn
 
 
 class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin):
-    ...
+  ...
 ```
 
 ### Step 2: Make `predict_noise()` PP-aware
@@ -340,10 +340,11 @@ TypeError: YourPipeline inherits PipelineParallelMixin but not CFGParallelMixin.
 
 ```python
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.pp_parallel import PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
+
 
 class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin):
-    ...
+  ...
 ```
 
 ### Issue: PP run hangs before decode or later collectives
@@ -383,7 +384,7 @@ Complete examples in the codebase:
 
 | Component               | Path                                                       | Notes                                                                                                                   |
 |-------------------------|------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|
-| `PipelineParallelMixin` | `vllm_omni/diffusion/distributed/pp_parallel.py`           | Core PP communication and scheduler helpers                                                                             |
+| `PipelineParallelMixin` | `vllm_omni/diffusion/distributed/pipeline_parallel.py`     | Core PP communication and scheduler helpers                                                                             |
 | Wan2.2 transformer      | `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py`  | Reference for layer partitioning, `IntermediateTensors`, `make_empty_intermediate_tensors`, and PP-aware weight loading |
 | Wan2.2 T2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py`     | Reference PP + CFG integration for text-to-video                                                                        |
 | Wan2.2 I2V pipeline     | `vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2_i2v.py` | Reference PP + CFG integration for image-to-video                                                                       |

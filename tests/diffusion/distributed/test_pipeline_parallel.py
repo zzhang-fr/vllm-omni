@@ -18,7 +18,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
-from vllm_omni.diffusion.distributed.pp_parallel import AsyncLatents, PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.platforms import current_omni_platform
 
 
