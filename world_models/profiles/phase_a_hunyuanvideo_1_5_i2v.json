@@ -1,0 +1,42 @@
+{
+  "phase": "A",
+  "description": "Baseline compute breakdown of HunyuanVideo-1.5-Diffusers-480p_i2v at 832x480, 33 frames, 30 denoising steps, guidance_scale=6.0, flow_shift=5.0 on 1x A100 80GB (single GPU, TP=1). Values averaged across Run 1 and Run 2 which agreed to within 0.5s.",
+  "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+  "pipeline_class": "HunyuanVideo15I2VPipeline",
+  "config": {
+    "size": "832x480",
+    "num_frames": 33,
+    "num_inference_steps": 30,
+    "guidance_scale": 6.0,
+    "flow_shift": 5.0,
+    "seed": 42,
+    "device": "A100 80GB PCIe",
+    "tensor_parallel_size": 1
+  },
+  "total_inference_s": 73.70,
+  "peak_memory_mb": 79952.0,
+  "stages_s": {
+    "text_encoder_forward_total": 0.197,
+    "vae_encode": 0.109,
+    "dit_denoising_loop_derived": 65.621,
+    "vae_decode": 6.470,
+    "framework_overhead_derived": 1.303
+  },
+  "stages_pct": {
+    "text_encoder_forward_total": 0.27,
+    "vae_encode": 0.15,
+    "dit_denoising_loop_derived": 89.04,
+    "vae_decode": 8.78,
+    "framework_overhead_derived": 1.77
+  },
+  "source_runs": [
+    {"label": "run_1", "text_encoder_forward": 0.196140, "vae_encode": 0.109456, "vae_decode": 6.471523, "pipeline_forward": 72.158723},
+    {"label": "run_2", "text_encoder_forward": 0.198200, "vae_encode": 0.108630, "vae_decode": 6.468751, "pipeline_forward": 72.648350}
+  ],
+  "headline": "DiT denoising dominates at ~89% of inference time; VAE decode is ~9%; text encoder and VAE encode are negligible. KV-cache-for-DiT and blockwise-causal attention are directly on the critical path; VAE tiling is a meaningful but secondary optimization.",
+  "notes": [
+    "Stage timings scraped from container stderr (--enable-diffusion-pipeline-profiler). The stage_durations field in the API response body is always empty; there is a broken link between HunyuanVideo15I2VPipeline._stage_durations and VideoGenerationArtifacts.stage_durations -- this is a real vllm-omni bug and a potential small contribution.",
+    "The pipeline's 'forward' metric wraps the entire __call__ including VAE and text encoder sub-calls; DiT denoising time is derived as forward - text_encoder - vae_encode - vae_decode.",
+    "Server warmup (run_0) is excluded; it had forward=36.84s and vae.decode=0.141s which are clearly not representative of a steady-state inference at 30 steps. Likely a startup validation with a different config."
+  ]
+}

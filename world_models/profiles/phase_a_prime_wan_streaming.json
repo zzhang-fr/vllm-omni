@@ -1,0 +1,18 @@
+{
+  "phase": "A_prime_streaming",
+  "model": "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+  "config": {
+    "num_frames": 4,
+    "num_inference_steps": 4,
+    "size": "832x480"
+  },
+  "inference_time_s": 2.5848013650029316,
+  "peak_memory_mb": 26454.0,
+  "stages_s": {
+    "text_encoder.forward": 0.1136,
+    "vae.encode": 0.3805,
+    "vae.decode": 0.2952,
+    "forward": 2.3254
+  },
+  "dit_derived_s": 1.5361
+}

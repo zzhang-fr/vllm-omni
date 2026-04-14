@@ -1,0 +1,37 @@
+{
+  "model": "Wan-AI/Wan2.1-VACE-1.3B-diffusers",
+  "prompt": "The red ball rolls slowly to the right across the beige table.",
+  "id": "video_gen_24a687b536e349c980daf16bde6fd896",
+  "object": "video",
+  "status": "completed",
+  "size": "832x480",
+  "progress": 100,
+  "seconds": "4",
+  "quality": "default",
+  "completed_at": 1776178639,
+  "created_at": 1776178585,
+  "remixed_from_video_id": null,
+  "error": null,
+  "media_type": "video/mp4",
+  "expires_at": null,
+  "file_name": "video_gen_24a687b536e349c980daf16bde6fd896.mp4",
+  "inference_time_s": 53.30194818699965,
+  "stage_durations": {},
+  "peak_memory_mb": 26452.0,
+  "_client_wall_s": 54.122,
+  "stage_durations_from_logs": {
+    "pipeline": "Wan22VACEPipeline",
+    "durations_s": {
+      "text_encoder.forward": 0.1136,
+      "vae.encode": 2.1978,
+      "vae.decode": 1.8723,
+      "forward": 51.6332
+    },
+    "counts": {
+      "text_encoder.forward": 2,
+      "vae.encode": 3,
+      "vae.decode": 1,
+      "forward": 1
+    }
+  }
+}

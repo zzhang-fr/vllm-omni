@@ -1,0 +1,265 @@
+{
+  "phase": "B",
+  "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
+  "config_constant": {
+    "size": "832x480",
+    "guidance_scale": 6.0,
+    "flow_shift": 5.0,
+    "seed": 42,
+    "tp": 1
+  },
+  "sweep_steps": [
+    {
+      "axis": "num_inference_steps",
+      "value": 30,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 76.106,
+      "inference_time_s": 74.68874143400171,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2,
+          "vae.encode": 0.1091,
+          "vae.decode": 6.6854,
+          "forward": 73.2166
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_inference_steps",
+      "value": 16,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 46.165,
+      "inference_time_s": 44.15782543200112,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2047,
+          "vae.encode": 0.112,
+          "vae.decode": 6.3864,
+          "forward": 42.6519
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_inference_steps",
+      "value": 8,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 28.187,
+      "inference_time_s": 26.18123332400137,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2069,
+          "vae.encode": 0.1117,
+          "vae.decode": 6.262,
+          "forward": 24.6666
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_inference_steps",
+      "value": 4,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 18.035,
+      "inference_time_s": 17.382687020002777,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2072,
+          "vae.encode": 0.1121,
+          "vae.decode": 6.5411,
+          "forward": 15.8973
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_inference_steps",
+      "value": 2,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 14.028,
+      "inference_time_s": 12.853531281998585,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2053,
+          "vae.encode": 0.1124,
+          "vae.decode": 6.5387,
+          "forward": 11.3654
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_inference_steps",
+      "value": 1,
+      "fixed": {
+        "num_frames": 33
+      },
+      "client_wall_s": 12.459,
+      "inference_time_s": 10.453282469999976,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.203,
+          "vae.encode": 0.1113,
+          "vae.decode": 6.3554,
+          "forward": 8.9398
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    }
+  ],
+  "sweep_frames": [
+    {
+      "axis": "num_frames",
+      "value": 33,
+      "fixed": {
+        "num_inference_steps": 30
+      },
+      "client_wall_s": 76.106,
+      "inference_time_s": 75.47042188399791,
+      "peak_memory_mb": 79952.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2039,
+          "vae.encode": 0.112,
+          "vae.decode": 6.5666,
+          "forward": 74.024
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_frames",
+      "value": 16,
+      "fixed": {
+        "num_inference_steps": 30
+      },
+      "client_wall_s": 30.048,
+      "inference_time_s": 29.341293356003007,
+      "peak_memory_mb": 69754.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2067,
+          "vae.encode": 0.1122,
+          "vae.decode": 2.0115,
+          "forward": 28.7485
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_frames",
+      "value": 8,
+      "fixed": {
+        "num_inference_steps": 30
+      },
+      "client_wall_s": 18.032,
+      "inference_time_s": 16.55473730799713,
+      "peak_memory_mb": 69758.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2063,
+          "vae.encode": 0.1121,
+          "vae.decode": 0.7316,
+          "forward": 16.3405
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    },
+    {
+      "axis": "num_frames",
+      "value": 4,
+      "fixed": {
+        "num_inference_steps": 30
+      },
+      "client_wall_s": 12.025,
+      "inference_time_s": 11.429475494001963,
+      "peak_memory_mb": 47052.0,
+      "stages": {
+        "pipeline": "HunyuanVideo15I2VPipeline",
+        "durations": {
+          "text_encoder.forward": 0.2053,
+          "vae.encode": 0.1126,
+          "vae.decode": 0.2049,
+          "forward": 11.3794
+        },
+        "counts": {
+          "text_encoder.forward": 2,
+          "vae.encode": 1,
+          "vae.decode": 1,
+          "forward": 1
+        }
+      }
+    }
+  ]
+}
