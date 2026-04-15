@@ -330,6 +330,20 @@ Summary of the scan (full bibliographic list in `related_works.md`):
 
 ### DreamZero (arXiv 2602.15922, NVIDIA, Feb 2026)
 
+**Correction notice:** the DreamZero summary below is from an earlier
+reading and contains two silent errors that were fixed later in the
+Phase D entry. (1) The 38× speed-up is GB200-only per Table 1; on H100
+the cumulative speed-up caps at 9.6×, and CFG parallelism is
+multi-GPU from row 2 onwards. (2) The step progression is 16 → 4 → 1,
+not "stays at 16" as I initially thought — DiT Caching does intra-
+chunk velocity reuse (16 → 4 effective steps), and DreamZero-Flash is
+a *training-time* noise-schedule change that further reduces to 1
+step. Also: the pre-optimization latency is 5.7 s per chunk and the
+bimanual action horizon is 1.6 s per chunk; pypdf had swallowed the
+leading digits in my first reading. See the Phase D journal entry
+below for the faithfully-reproduced Table 1 and the full list of
+corrections.
+
 Fetched the paper. Critical corrections to earlier misreading:
 
 - **DreamZero is literally a video DiT.** *"DreamZero, a 14B robot
@@ -652,22 +666,21 @@ Wan-1.3B than HunyuanVideo-13B (47 s vs 66 s), not 10×.
 - Framework: 0.261 s (10.1%)
 - Peak memory: 26.5 GB
 
-**20.6× speedup** over the Wan offline baseline (53.3 → 2.585 s) purely
-from the operating-point change. No caching, no quantization, no
-algorithmic tricks — just "pick the hyperparameters the streaming
-literature actually uses".
+Ratio to the Wan offline baseline on the same hardware and the same
+model: 53.30 / 2.585 ≈ 20.6×. This is a fact about our own two
+configurations; it is not a claim about what fraction of any paper's
+reported speed-up is attributable to hyperparameter choice.
 
-HunyuanVideo at the same streaming point, extrapolated from Phase B
-(DiT linear in steps, `steps=4` column of the `num_frames=4` row is
-`10.86 × 4/30 ≈ 1.45 s`; add ~0.6 s for VAE + framework): **~2.05 s**
-per chunk. **~36× speedup** from operating-point change alone.
+HunyuanVideo at the same streaming point was **not measured** and we
+are not attaching a number to it. A rough Phase B extrapolation (DiT
+linear in steps: `10.86 × 4/30 ≈ 1.45 s` + VAE + framework) suggests
+~2 s per call on 1× A100, but it is an extrapolation, not a measurement.
 
-**Most important finding across Phase A/B/A':** at the streaming
-operating point, the DiT-dominance inverts meaningfully. From 89% on
-the offline baseline, DiT drops to ~60% on Wan / ~70% on HunyuanVideo
-at 4 frames × 4 steps, because VAE encode/decode and framework
-overhead have fixed components that become non-negligible fractions of
-a much smaller chunk budget. See Phase D for the contribution-target
+**Most important finding across Phase A/B/A':** at the streaming-ish
+operating point on Wan, the DiT-dominance from the offline baseline
+(89%) drops to ~60%, because VAE encode/decode and framework overhead
+have fixed components that become non-negligible fractions of a much
+smaller chunk budget. See Phase D for the contribution-target
 implications.
 
 Artifacts: `profiles/phase_a_Wan2.1-VACE-1.3B-diffusers.json`,
@@ -675,56 +688,90 @@ Artifacts: `profiles/phase_a_Wan2.1-VACE-1.3B-diffusers.json`,
 
 ### Phase D — Literature cross-check
 
-Full table and attribution in `profiles/phase_d_cross_check.md`. Three
-gap analyses:
+Full writeup and the faithfully-reproduced Table 1 from DreamZero are
+in `profiles/phase_d_cross_check.md`. An earlier draft of both this
+journal section and the cross-check file contained invalid cross-
+baseline comparisons; it has been rewritten to report measurements and
+reference-paper numbers side-by-side **without** attempting to
+attribute a cross-baseline gap to specific optimization categories.
 
-1. **Our offline baseline → our streaming point (same hardware, same
-   model, zero engineering).** HunyuanVideo-13B: ~35.9×. Wan-1.3B: 20.6×.
-   This is the DreamZero-advertised 38× *almost entirely* attributable
-   to "pick sensible inference hyperparameters for your use case".
-   Nobody in the literature credits this because it's the non-research
-   bit, but it's the biggest lever by far.
+Key corrections relative to the earlier draft:
 
-2. **Our Wan-1.3B streaming point (2.585 s) → DreamZero's 150 ms per
-   chunk on H100-class hardware: 17.2× gap.** Decomposes as roughly
-   hardware 3–5× × quantization 1.5–2× × kernels 1.3–1.5× × caching
-   1.5–2× × algorithmic 1.5–2× — product of midpoints ≈ 17×, matches
-   the observed gap. **This is a fit to the gap, not a measurement of
-   each component in isolation**, but it bounds each factor plausibly.
+1. **DreamZero's 5.7 s baseline, not 7 s.** The earlier reading missed
+   the leading digit because pypdf split the number across a line
+   break. Corresponding "1.6 seconds per chunk" is also 1.6 s, not 6 s.
+2. **DreamZero's step-reduction progression is 16 → 4 → 1**, not
+   "stays at 16". **DiT Caching** (velocity reuse between successive
+   denoising steps within one chunk, based on cosine similarity of
+   flow-matching velocities) reduces the effective step count from
+   16 to 4. **DreamZero-Flash**, a *training-time* change that
+   decouples the noise schedules for video and action modalities,
+   further reduces to 1 step. Table 3 in the paper shows the empirical
+   cost: naive 1-step inference loses 31 task-progress points on
+   table-bussing (83% → 52%) while 1-step DreamZero-Flash loses only
+   9 (83% → 74%).
+3. **The 38× headline is GB200-only.** It requires NVFP4 weights +
+   activations (a Blackwell-generation feature) and DreamZero-Flash.
+   The cumulative speed-up **on H100 caps at 9.6×** per Table 1 in the
+   paper. The NVFP4 and DreamZero-Flash rows are dashed for H100.
+4. **CFG Parallelism is multi-GPU.** DreamZero distributes the two
+   classifier-free-guidance forward passes across two GPUs as the
+   first optimization row in Table 1, so the post-baseline
+   configuration in the paper is never single-GPU.
+5. **DreamZero's "DiT Caching" and RFC #1987 / StreamDiffusionV2's
+   "rolling KV cache across chunks" are different optimizations** and
+   should not be conflated. DiT Caching is intra-chunk velocity reuse
+   within a denoising loop. Rolling KV cache is cross-chunk prefix
+   reuse across autoregressive chunk boundaries. DreamZero does mention
+   KV caching for efficiency in §3.1 but does not break it out with its
+   own row in Table 1.
 
-3. **Our Wan-1.3B streaming point (1.55 FPS) → StreamDiffusionV2's
-   64.52 FPS on 4× H100 for the 1.3B: 41.6× gap.** Dominated by
-   hardware (1× A100 → 4× H100 is 6–10× alone); the remainder comes
-   from rolling KV cache, pipeline orchestration, and SLO-aware
-   batching — all things RFC #1987's infrastructure work would deliver.
+Given those corrections, the cross-check is limited to reporting what
+each source measured on its own stack: our numbers on 1× A100, Table 1
+from DreamZero on H100 / GB200, and StreamDiffusionV2's 58 FPS /
+64 FPS numbers on 4× H100. No attempt is made in this writeup to
+attribute the gap between our measurements and theirs to specific
+optimization categories — an earlier version tried, and the
+attribution did not survive cross-reading.
 
-### Phase E — Recommendation: three contribution targets for vllm-omni
+### Phase E — Contribution targets for vllm-omni (revised)
 
-In priority order by **leverage at the streaming operating point**,
-which is the regime RFC #1987's infrastructure is being built for:
+In priority order by a qualitative assessment of leverage and
+feasibility on our 1× A100 setup, with attribution deliberately
+conservative:
 
 1. **Fix the `stage_durations` plumbing bug.** Small two-file patch,
    zero risk, directly useful: the `DiffusionPipelineProfiler` already
    populates `_stage_durations` on the pipeline, but the engine never
    forwards it to `VideoGenerationArtifacts.stage_durations` in the
    response. Every future profiling contribution needs this. **Do this
-   first**, both as a warmup and as a concrete "I am now a
-   contributor" moment.
-2. **Framework / per-call overhead reduction.** We're spending
-   ~260–300 ms per call on framework, VAE staging, and HTTP round
-   trip even on 2 s chunks. For 150 ms chunks that's ≥100% overhead.
-   **Profile this more carefully from the client and server sides
-   before committing**, then argue the numbers on RFC #2073 (the
-   step-wise engine refactor). If #2073 is actively in progress we
-   may be able to contribute a small piece of it rather than fighting
-   the whole architecture.
-3. **Rolling KV cache + blockwise-causal attention for Wan / HunyuanVideo
-   DiTs.** This is the core of RFC #1987 and arguably the biggest
-   intellectual payoff, but it's ~1.5–2× at our measured streaming
-   operating point — worthwhile, not the headline win. It's also the
-   highest complexity, gated on #2073 landing. **Do this after (1) and
-   (2), with StreamDiffusionV2's released code as a reference
-   implementation for the sink-token + rolling-cache design**.
+   first** — both as a warmup and as a concrete "I am now a contributor"
+   moment.
+2. **Framework / per-call overhead reduction.** Our measurement shows
+   ~260 ms per call of framework overhead (derived) at the
+   streaming-ish operating point on Wan-1.3B, 4 frames × 4 steps.
+   That is ≥100% of the 150 ms chunk budget the DreamZero paper
+   targets. Profile this more carefully from both client and server
+   sides before committing, then argue the concrete numbers on
+   RFC #2073 (the step-wise engine refactor). If #2073 is actively in
+   progress we may be able to contribute a small focused piece of it.
+3. **Rolling KV cache + blockwise-causal attention for Wan /
+   HunyuanVideo DiTs.** The core of RFC #1987 and the most direct
+   match for StreamDiffusionV2's cross-chunk caching. **We do not have
+   a measured speed-up number for this on our hardware**, and the
+   numbers in DreamZero's Table 1 and StreamDiffusionV2's headline do
+   not transfer across hardware and training regimes without careful
+   caveats. If we want a defensible "this much speed-up is on the
+   table" argument for the RFC, we need to measure it ourselves on a
+   causal Wan variant first. Until we do, target 3 is a research
+   commitment, not a quantified target.
+
+Optional follow-up work that would sharpen target 3: reproduce
+StreamDiffusionV2's rolling-KV-cache recipe (sink tokens + sliding
+window) on a causal Wan checkpoint via `diffusers` directly, measure
+the speed-up vs. a naive chunked baseline on our A100, and contribute
+the measurement either back as a comment on RFC #2590 or as a
+stand-alone benchmark PR.
 
 ### Things we deliberately did not do this session
 
