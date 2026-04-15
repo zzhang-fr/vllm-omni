@@ -811,3 +811,63 @@ world_models/
     phase_b_frames.png
     phase_d_cross_check.md          Phase D analysis and gap attribution
 ```
+
+---
+
+## 2026-04-15 — Terminology note: the DreamZero data hierarchy
+
+For future reference when reading the DreamZero paper or arguing on
+RFC #1987, this is the nested structure of units DreamZero operates on,
+with their default numeric values from the paper (§3, §A, Algorithm 1):
+
+```
+dataset                                       (~500 hours of teleop data on AgiBot G1)
+  └─ trajectory                               (one full episode / demonstration,
+     │                                         one task from start to end)
+     │                                         ~4.4 min average on AgiBot G1,
+     │                                         ~42 subtasks per episode
+     │
+     └─ chunk                                 (M = 4 chunks per trajectory by default,
+        │                                      K = 2 latent frames per chunk,
+        │                                      H = 48 action steps per chunk at 30 Hz
+        │                                      → 1.6 s of robot motion per chunk)
+        │
+        └─ latent frame                       (after ~4× temporal 3D-VAE compression,
+           │                                   so K = 2 latent ≈ 8 raw video frames)
+           │                                   max context = 4 × 2 = 8 latent frames
+           │                                   = 33 raw frames ≈ 6 s of observation
+           │
+           └─ token                           (spatial patches from the VAE latent,
+                                               ~(H/8) × (W/8) per latent frame
+                                               after the 8× spatial patchify;
+                                               for 832×480 that is 60 × 104 = 6 240
+                                               tokens per latent frame)
+```
+
+Notes:
+
+- **Our `num_frames` API field is raw frames**, not latent frames. Every
+  `num_frames` in the Phase A / Phase B journal tables and JSON files
+  refers to output video frames as a viewer would see them, at 24 fps
+  in our config. The DiT internally sees roughly `num_frames / 4 + 1`
+  latent frames.
+- The attention sequence length the DiT's cost depends on is roughly
+  `S = latent_frames × spatial_tokens_per_latent_frame`. For our
+  offline baseline (832×480, 33 raw frames), `S ≈ 9 × 6240 = 56 000`
+  tokens. For DreamZero's single chunk (K = 2 latent frames at
+  whatever their trained resolution is), `S` is much smaller and
+  matches their cost/latency targets accordingly.
+- "Trajectory" in DreamZero's own usage always means "one complete
+  robot episode" (demonstration at training time, deployment run at
+  inference time) — **not** "sequence of predicted actions" as in some
+  prior robotics-video literature. When we talk about "rollouts" in
+  our project, we mean roughly the same thing as DreamZero's
+  "trajectory": one complete run from an initial observation to the
+  end of the task.
+- DreamZero's chunk boundary is also the KV-cache rollover boundary in
+  inference: after each chunk of actions is executed, ground-truth
+  observations replace the model's predicted frames in the cached K/V
+  of prior chunks (§3.1), so compounding errors are bounded to within
+  a single chunk's denoising loop. This is a closed-loop-robotics
+  specific trick that does not transfer directly to our toy
+  open-loop-video project.
