@@ -520,12 +520,351 @@ or served on.
 - **#2063 / #2160 / #2078 / #2423** — CFG parallel refactors. Merged;
   prereqs for DreamZero.
 
+## C.5 Serving patterns for world model inference (added 2026-04-16)
+
+Three serving patterns recur across world model papers. They form a
+**stack**, not a set of parallel concerns — each layer presupposes
+the one below it:
+
+```
+Layer 3 — KV-cache reuse          (performance optimization)
+    makes Layer 1+2 efficient: carry forward cached computation
+    instead of re-encoding overlapping context each step.
+    Presupposes: a rollout loop (Layer 1) generating chunks whose
+    context overlaps, managed via a window policy (Layer 2).
+
+Layer 2 — Sliding window context  (what the model sees)
+    decides which prior frames condition the next generation,
+    and evicts/compresses older context.
+    Presupposes: a rollout loop (Layer 1) that produces the
+    frames to window over.
+
+Layer 1 — Multi-step rollout      (control flow)
+    server orchestrates the output→input feedback loop.
+    Works without Layers 2 or 3: each step can be stateless
+    (re-encode everything from scratch, pass only the last
+    frame). Slow but correct — this is what our rollout.py does.
+```
+
+Each layer can be implemented independently of the ones above it:
+- Layer 1 alone = our current `rollout.py` (stateless, re-encode
+  everything, pass one frame). Correct but slow.
+- Layer 1+2 = pass the last N frames as raw input each step,
+  let the model re-encode them. Richer context, still redundant
+  compute.
+- Layer 1+2+3 = carry forward KV-cache entries from chunk N to
+  chunk N+1, only compute the new tokens. Efficient.
+
+No single paper unifies all three layers into a reusable serving
+framework. **This framing is our synthesis, not established
+consensus.** For each layer we document what is sourced vs. inferred.
+
+### Layer 1 — Multi-step rollout (server-managed output→input loop)
+
+*What it is:* The server orchestrates a loop where the output of
+generation N (e.g., the last frame of a video clip) feeds as input to
+generation N+1. The client submits a session with an action sequence;
+the server manages the frame feedback internally.
+
+*Where this comes from:* Generalized from our own `rollout.py` (which
+does this client-side) and concrete examples in the literature:
+
+- **DreamZero** (arXiv:2602.15922) — implements a WebSocket server
+  where the rollout loop is explicitly server-managed. The
+  `ARDroidRoboarenaPolicy` wrapper "handles frame accumulation"
+  server-side: "first request uses 1 frame, subsequent requests use
+  4 frames for temporal context." *Sourced from paper / code.*
+- **StreamDiffusionV2** (arXiv:2511.07399, MLSys 2026) — continuous
+  streaming pipeline where the server manages frame-by-frame
+  generation with SLO-aware scheduling. The rollout loop is implicit
+  in the streaming architecture. *Sourced from paper.*
+- **MAGI-1** (arXiv:2505.13211) — chunk pipelining where "the next
+  chunk begins generation, conditioned on all preceding chunks." But
+  framed as within-request parallelism, not multi-user serving.
+  *Sourced from paper.*
+- **Genie 3** — generates frames autoregressively "by considering the
+  complete history of previously generated frames and the user's
+  latest actions." Implies server-managed rollout; no paper published,
+  only blog. *Inferred from blog description.*
+
+*What is NOT in the literature:* No paper generalizes this as a
+reusable serving primitive with a defined API. Every implementation
+is either client-side (our `rollout.py`), application-specific
+(DreamZero's WebSocket), or proprietary (Genie 3, Oasis).
+
+### Layer 2 — Sliding window context (server-managed frame history)
+
+*What it is:* The server maintains a configurable window of recent
+frames (or their KV-cache entries) as conditioning context for the
+next generation. Older frames are evicted or compressed. Presupposes
+Layer 1 — there must be a rollout loop producing frames to window
+over.
+
+*Where this comes from:* Inferred from model requirements — multiple
+models need multi-frame context, and a server that supports them needs
+to manage it:
+
+- **MAGI-1** — explicitly supports configurable context windows: "by
+  setting the KV range to 8 for all chunks, each newly generated chunk
+  depends only on the preceding 8 seconds of video content." Closest
+  to a serving-configurable parameter. *Sourced from paper.*
+- **StreamDiffusionV2** — manages temporal context through sink-token-
+  guided rolling KV cache with periodic RoPE refresh. This is
+  server-managed context retention. *Sourced from paper.*
+- **Deep Forcing** (arXiv:2512.05081) — introduces "Deep Sink" with
+  persistent sink tokens and RoPE realignment. Inference optimization,
+  not a serving feature. *Sourced from paper.*
+- **Wan 2.1-VACE** — conditions on multiple reference frames (first,
+  last, arbitrary). The model needs multi-frame input; somebody has to
+  manage which frames to pass. *Inferred from model API.*
+- **Genie 2** — "explicit scene memory so off-screen content renders
+  consistently on return." *Sourced from blog.*
+- **Matrix-Game 3.0** (arXiv:2604.08995) — camera-aware memory
+  selection that "retrieves only view-relevant historical content based
+  on camera pose." Retrieval-based, not fixed window. *Sourced.*
+
+*What is NOT in the literature:* No serving system exposes a
+"configure your context window" API for video world models.
+
+### Layer 3 — Cross-chunk KV-cache reuse
+
+*What it is:* When generating chunk N+1, reuse KV-cache entries
+computed during chunk N instead of re-encoding the overlapping
+context from scratch. This is a performance optimization on top of
+Layers 1+2 — it makes the rollout loop and context window efficient
+by avoiding redundant computation. Presupposes both lower layers.
+
+*Where this comes from:* This layer has the clearest prior art,
+both in video diffusion and by analogy to LLM serving (vLLM's prefix
+caching, multi-turn KV-cache reuse):
+
+- **Ca2-VDM** (ICML 2025, arXiv:2411.16375) — most explicit:
+  "unidirectional feature computation ensures that the cache of
+  conditional frames can be precomputed in previous autoregression
+  steps and reused in every subsequent step, eliminating redundant
+  computations." *Sourced from paper.*
+- **MAGI-1** — "once a chunk has been sufficiently denoised, its
+  features can be cached and reused by subsequent denoising chunks
+  without the need for recomputation." *Sourced from paper.*
+- **StreamDiffusionV2** — uses adaptive context retention through sink
+  tokens rather than full KV-cache forwarding. *Sourced from paper.*
+- **Chorus** (arXiv:2604.04451, Apr 2026) — pure serving systems
+  paper on inter-*request* KV cache reuse for video diffusion: "up to
+  45% speedup on industrial 4-step distilled models." Addresses
+  cross-request similarity, not cross-chunk reuse within a rollout.
+  *Sourced from paper.*
+- **FlowCache** (arXiv:2603.27469) — chunkwise caching policies for
+  video rollout. Explicitly calls out the gap between algorithmic
+  and serving-level optimization. *Sourced from paper.*
+- **TempCache** (arXiv:2602.01801) — "compresses the KV cache via
+  temporal correspondence to bound cache growth," 5–10× speedup.
+  Inference optimization, not serving infrastructure. *Sourced.*
+- **LLM analogy** — vLLM's prefix caching and multi-turn KV-cache
+  reuse are the direct precedent in the text domain. The video
+  analogue is recognized but not yet implemented in any open serving
+  framework. *Inferred by analogy.*
+
+### The gap
+
+No paper or system unifies these three layers into a general-purpose
+world model serving framework. StreamDiffusionV2 comes closest (it is
+the only MLSys-track paper treating streaming video generation as a
+systems problem) but is a standalone system, not integrated into a
+general model-serving framework like vLLM. This gap is where
+vllm-omni could contribute: building these layers incrementally on
+top of its existing diffusion engine.
+
+The stack structure maps naturally onto the tier progression:
+- **Tier 1 (simulation)** exercises Layer 1 — the rollout loop.
+  Latency is not a concern, so Layers 2–3 are optional.
+- **Tier 2 (interactive)** requires Layers 1+2 and benefits greatly
+  from Layer 3 — real-time latency demands both context management
+  and cache reuse.
+- **Tier 3 (robotics)** requires all three layers under the tightest
+  constraints, plus action-modality prediction on top.
+
+**Provenance note:** The identification of this gap and the stack
+framing are our synthesis from surveying the literature — not a claim
+made by any cited paper. FlowCache (arXiv:2603.27469) comes closest
+to stating the gap explicitly, noting that "nominal low-bit coding
+alone does not solve the deployment problem" due to systems-level
+inefficiencies.
+
 ---
 
-# Part D — What this means for *our* project
+# Part D — Three-tier taxonomy: simulation → interactive → robotics
+
+The literature supports a three-tier ordering of world model workloads
+by increasing difficulty. This section collects the evidence and maps
+it to concrete models. It was added on 2026-04-16 after a team
+discussion about RFC #1987's prioritization.
+
+## D.1 The tiers
+
+| Tier | Synonym | Action regime | Latency constraint | Key challenge |
+|------|---------|---------------|--------------------|---------------|
+| **Simulation / offline** | Batch, open-loop | All actions known upfront | None (seconds–minutes OK) | Temporal coherence over long horizons |
+| **Interactive / online** | Streaming, game | Actions arrive one at a time from a user | Real-time (~20–60 FPS) | Causal architecture + error accumulation under feedback |
+| **Robotics / closed-loop** | Embodied, physical AI | Actions arrive from sensors + policy | Hard real-time (7–30 Hz, <150 ms) | Physical precision + safety + joint action prediction |
+
+Each tier is a strict superset of the previous in terms of
+architectural requirements:
+
+- **Simulation → Interactive** adds: causal/autoregressive generation
+  (cannot use bidirectional attention across future frames), real-time
+  latency, and online error accumulation management.
+- **Interactive → Robotics** adds: joint action-modality prediction,
+  multi-sensor fusion, contact-rich physics accuracy, safety/reliability
+  constraints, and cross-embodiment generalization.
+
+## D.2 Literature supporting this ordering
+
+### Explicit taxonomies
+
+- **"Simulating the Visual World with AI: A Roadmap"** (Yue, Huang,
+  Chen, Wang, Wan, Liu; arXiv:2511.08585, CVPR 2025 tutorial) —
+  proposes four generations: Gen 1 (Faithfulness ≈ simulation),
+  Gen 2 (Interactiveness ≈ interactive), Gen 3 (Planning ≈ robotics),
+  Gen 4 (Stochasticity ≈ general-purpose physical simulator). The
+  authors describe these as "advancing step by step."
+  Tutorial page: https://world-model-tutorial.github.io/
+- **ACM CSUR survey** (Ding et al., 2025, arXiv:2411.14499) — splits
+  by function (representation vs. prediction) and domain (game,
+  embodied, urban, societal). The game → embodied progression aligns
+  with interactive → robotics.
+- **"Video Generation Models as World Models"** (arXiv:2603.28489,
+  2026) — distinguishes batch diffusion (offline) from "autoregressive,
+  hybrid AR-diffusion, and causal streaming diffusion paradigms [that]
+  explicitly target world-model requirements." States that batch
+  approaches "do not by themselves resolve the challenges of persistent
+  rollout and long-term error accumulation."
+
+### Simulation < Interactive
+
+- **Xun Huang, "Towards Video World Models"**
+  (https://www.xunhuang.me/blogs/world_model.html) — argues non-causal
+  video generators are fundamentally unable to support interactivity;
+  causality is a prerequisite, making interactive strictly harder.
+- **GameNGen** (arXiv:2408.14837) — even for a well-defined game
+  (DOOM), interactive generation required novel noise augmentation to
+  prevent drift — a challenge absent in offline generation.
+
+### Interactive < Robotics
+
+- **"World-in-World"** (arXiv:2510.18135) — closed-loop evaluation
+  finds navigation (simpler) improves with world models, but "robotic
+  manipulation demonstrates notably weaker gains" because "accurately
+  modeling contact-rich interactions and robot kinematics is
+  significantly more challenging than predicting viewpoint changes."
+- **DreamZero** — requires 7 Hz closed-loop at 150 ms/chunk, joint
+  video+action prediction, cross-embodiment transfer, and real-robot
+  safety. None required for gaming.
+
+### Simulation/interactive models as evaluation proxies for robotics
+
+- **"Interactive World Simulator for Robot Policy Training and
+  Evaluation"** (arXiv:2603.08546, 2026) — policies trained on 100%
+  simulator data achieve 87.9% vs. 90.3% on real data (near parity).
+- **V-JEPA 2** (Meta, arXiv:2506.09985) — deployed zero-shot on real
+  Franka arms after training on unlabeled robot video only.
+- **UniSim** (ICLR 2024, arXiv:2310.06114) — trained RL policies
+  purely in simulation with demonstrated real-world transfer.
+- **1X World Model Challenge** (CVPR 2025) — 100 hours of humanoid
+  data for world model evaluation without physical robots.
+
+## D.3 Mapping existing models to tiers
+
+### Tier 1 — Simulation / offline
+
+Models that generate video from a complete specification (prompt,
+trajectory, action sequence) without real-time interaction. **Every
+non-causal video generation model is a tier-1 model by definition** —
+all inputs are known upfront, no real-time constraint.
+
+Already in vllm-omni (3 families, 10+ variants):
+
+| Model | Pipeline | Scale | Mode | Notes |
+|-------|----------|-------|------|-------|
+| **LTX-2** | `LTX2Pipeline` | ~2B | T2V | Fastest iteration; good for pipeline debugging |
+| **LTX-2 I2V** | `LTX2ImageToVideoPipeline` | ~2B | I2V | |
+| **LTX-2 two-stage** | `LTX2TwoStagesPipeline` | ~2B | T2V | Two-stage variant |
+| **LTX-2 I2V two-stage** | `LTX2ImageToVideoTwoStagesPipeline` | ~2B | I2V | Two-stage variant |
+| **Wan 2.1 T2V** | `WanPipeline` | 1.3B / 14B | T2V | |
+| **Wan 2.2 T2V** | `WanPipeline` | — | T2V | |
+| **Wan 2.2 TI2V** | `WanPipeline` | 5B | T2V | |
+| **Wan 2.2 I2V** | `WanImageToVideoPipeline` | ~14B MoE | I2V | |
+| **Wan 2.1-VACE** | `WanVACEPipeline` | 1.3B / 14B | T2V, I2V, V2V, R2V, inpainting | Multi-frame conditioning; previews context management tier 2 needs |
+| **HunyuanVideo 1.5** | `HunyuanVideo15Pipeline` | 13B | T2V | |
+| **HunyuanVideo 1.5 I2V** | `HunyuanVideo15ImageToVideoPipeline` | 13B | I2V | Our Phase A/B baseline |
+
+Not yet in vllm-omni but open-weight:
+
+| Model | Scale | Notes |
+|-------|-------|-------|
+| **Cosmos-Predict 2.5** | 2B–14B | NVIDIA WFM; open-weight |
+| **MAGI-1** | 24B | Chunk-wise AR; streaming-capable but designed for offline quality |
+
+Our 5-step rollout (`rollout.py`) uses HunyuanVideo 1.5 I2V as a
+frozen transition function — a tier-1 demonstration.
+
+### Tier 2 — Interactive / online
+
+Models that generate frames causally, conditioned on live user input:
+
+| Model | Scale | FPS | Notes |
+|-------|-------|-----|-------|
+| **DIAMOND** | ~100M | N/A (RL) | Diffusion world model for Atari; 3-step denoising |
+| **GameNGen** | ~1B | 20 | Modified Stable Diffusion; DOOM |
+| **Oasis** | ~500M | 20 | DiT; Minecraft |
+| **Lucid** | — | 20+ | VAE with 128× compression; Minecraft |
+| **MineWorld** | — | 4–7 | Visual-action AR transformer; Minecraft |
+| **Matrix-Game 3.0** | 17B | RT | Streaming with long-horizon memory |
+| **Genie 2/3** | — | RT | DeepMind; closed |
+| **Hunyuan-GameCraft 2** | — | — | Instruction-following; Tencent |
+| **GameGen-X** | — | — | Open-world game generation; Tencent |
+| **CausVid** | 1.3B–14B | ~9.4 | Causal distillation of Wan; streaming |
+| **Self-Forcing** | 1.3B | 17 | AR distillation; NeurIPS 2025 |
+
+### Tier 3 — Robotics / closed-loop
+
+Models that jointly predict observations and actions for real-time
+robot control:
+
+| Model | Scale | Hz | Notes |
+|-------|-------|----|-------|
+| **DreamZero** | 14B | 7 | World Action Model on Wan backbone |
+| **V-JEPA 2** | 1.2B | — | Latent dynamics; zero-shot robot transfer |
+| **Cosmos-Policy** | — | — | NVIDIA; RoboCasa/Libero |
+| **π0 / π0.5** | — | — | VLA baseline (not a world model per se) |
+
+## D.4 Implications for RFC #1987
+
+RFC #1987 puts robotics (tier 3) as P0 and defers simulation (tier 1)
+and interactive (tier 2) to P2. This is inverted relative to the
+difficulty ordering above. The concern:
+
+1. **Infrastructure built for tier 3 may be over-engineered for tiers
+   1–2**, or conversely may skip foundational serving primitives
+   (chunked generation, KV-cache rollover, streaming APIs) that tiers
+   1–2 would exercise and validate first.
+2. **Evaluation requires simulation-tier infrastructure** — without a
+   physical robot, DreamZero can only be tested if we already have a
+   working simulation/interactive serving path.
+3. **The literature's progression is bottom-up** — every interactive
+   model was first validated as a good offline generator; every
+   robotics model reuses interactive-tier primitives.
+
+A bottom-up roadmap (simulation → interactive → robotics) would let
+each tier validate the serving infrastructure the next tier needs.
+
+---
+
+# Part E — What this means for *our* project
 
 Reading the survey and the web results together, here is the honest
-positioning of the project relative to the field:
+positioning of the project relative to the field (written during the
+Phase A/B profiling session; see Part D for the tier-based reframing
+added 2026-04-16):
 
 1. **Our "toy rollout" experiments (Stage 1/2) are in the B.6 bucket**
    — interactive video / game world models — and the current frontier

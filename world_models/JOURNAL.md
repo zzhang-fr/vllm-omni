@@ -871,3 +871,154 @@ Notes:
   a single chunk's denoising loop. This is a closed-loop-robotics
   specific trick that does not transfer directly to our toy
   open-loop-video project.
+
+---
+
+## 2026-04-16 — Tier taxonomy and roadmap rethink
+
+### Context
+
+Team meeting raised a concern about RFC #1987's prioritization:
+DreamZero (robotics, closed-loop, real-time) is P0, while simulation
+(offline) and interactive video/game (online) are deferred to P2. The
+team's intuition was that this is inverted — robotics is the hardest
+tier, not the natural starting point. We did a literature review to
+validate or challenge this.
+
+### Findings: three tiers, ordered by difficulty
+
+The literature broadly supports three tiers of world model workloads,
+each a strict superset of the previous in architectural requirements:
+
+**Tier 1 — Simulation / offline.** All actions or controls are known
+upfront. The model generates a complete video in batch. Can use
+bidirectional attention. No latency constraint. Our 5-step rollout
+from Stage 2 is an example: we specified all five action prompts
+before generating any video. Models: HunyuanVideo 1.5, Wan 2.1/2.2,
+MAGI-1, Cosmos-Predict 2.5.
+
+**Tier 2 — Interactive / online.** Actions arrive one at a time from a
+user (keyboard, mouse, text). The model must generate frames causally
+and in real-time. Requires autoregressive or causal streaming
+architecture — bidirectional models fundamentally cannot do this (Xun
+Huang's analysis). Must manage error accumulation under feedback.
+Models: DIAMOND (Atari), GameNGen (DOOM), Oasis (Minecraft),
+Matrix-Game 3.0, Genie 2/3, CausVid, Self-Forcing.
+
+**Tier 3 — Robotics / closed-loop.** Actions arrive from sensors and a
+policy at hard real-time rates (7–30 Hz). Must jointly predict
+observations *and* actions. Must handle contact-rich physics,
+multi-sensor input, cross-embodiment transfer, and safety constraints.
+"World-in-World" (arXiv:2510.18135) found that robotic manipulation
+shows "notably weaker gains" from world models than navigation because
+"accurately modeling contact-rich interactions and robot kinematics is
+significantly more challenging." Models: DreamZero, V-JEPA 2,
+Cosmos-Policy.
+
+The clearest published taxonomy is the "four generations" roadmap
+(Yue et al., arXiv:2511.08585, CVPR 2025 tutorial): Gen 1
+(Faithfulness ≈ simulation) → Gen 2 (Interactiveness) → Gen 3
+(Planning ≈ robotics) → Gen 4 (Stochasticity). They describe these as
+"advancing step by step."
+
+### Why this ordering matters for RFC #1987
+
+1. **Infrastructure flows bottom-up.** Every interactive model was
+   first validated as a good offline generator. Every robotics model
+   reuses interactive-tier primitives (causal generation, KV-cache
+   rollover, streaming APIs). Starting at tier 3 means building and
+   debugging all three tiers simultaneously.
+
+2. **Evaluation requires lower tiers.** Without a physical robot,
+   DreamZero can only be evaluated through a simulation or interactive
+   serving path. The literature confirms this: "Interactive World
+   Simulator for Robot Policy Training" (arXiv:2603.08546) showed
+   policies trained on 100% simulator data achieve near-parity with
+   real data (87.9% vs 90.3%).
+
+3. **vllm-omni already has tier 1 models.** HunyuanVideo 1.5, Wan
+   2.1/2.2, Wan-VACE, and LTX-2 are all in-tree. A tier-1 world model
+   serving path (multi-step rollout with frame feedback) could be built
+   and validated today, exercising chunked generation and the video API
+   without any new model integration.
+
+### Proposed roadmap direction
+
+Rather than jumping to DreamZero (tier 3), build the serving
+infrastructure tier by tier. Each tier validates the primitives the
+next tier needs. See `related_works.md` Part D for the full literature
+backing. A concrete model sequence is being developed — see next
+journal entry.
+
+### Serving patterns: what the infrastructure needs to provide
+
+A follow-up question in the same session: what serving primitives does
+a world model server need, and have these been discussed in the
+literature?
+
+We identified three recurring patterns that form a **stack** (each
+layer presupposes the one below), not parallel concerns:
+
+```
+Layer 3 — KV-cache reuse          (performance: avoid redundant compute)
+Layer 2 — Sliding window context  (what the model sees: which frames?)
+Layer 1 — Multi-step rollout      (control flow: output→input loop)
+```
+
+Layer 1 works without 2 or 3 — our `rollout.py` is Layer 1 only
+(stateless, re-encode everything, pass one frame). Layer 2 adds richer
+context (pass last N frames) but still redundant compute. Layer 3 makes
+1+2 efficient by carrying forward KV-cache entries. Each layer
+presupposes the ones below: there's nothing to cache (L3) if you're
+not tracking a context window (L2), and no window to manage if you're
+not doing a rollout (L1).
+
+**Important provenance note:** each layer has prior art in individual
+papers, but framing them as a stack of serving primitives is our
+synthesis — no single paper does this. We are explicit in
+`related_works.md` C.5 about what is sourced and what is inferred.
+
+Key references per layer:
+- **L1:** DreamZero's WebSocket server (sourced: arXiv:2602.15922),
+  StreamDiffusionV2's streaming pipeline (sourced: arXiv:2511.07399).
+- **L2:** MAGI-1's configurable KV range (sourced: arXiv:2505.13211),
+  VACE's multi-frame conditioning (inferred from model API).
+- **L3:** Ca2-VDM's explicit cross-chunk cache reuse (sourced: ICML
+  2025, arXiv:2411.16375), Chorus's inter-request cache reuse
+  (sourced: arXiv:2604.04451), vLLM prefix caching as LLM-domain
+  precedent (inferred by analogy).
+
+**The gap:** No paper or system unifies all three layers into a
+general-purpose world model serving framework. StreamDiffusionV2
+comes closest but is a standalone system, not integrated into a
+general serving framework. This gap is our synthesis — FlowCache
+(arXiv:2603.27469) comes closest to stating it.
+
+The stack maps onto the tier progression:
+- **Tier 1 (simulation)** exercises Layer 1. Latency doesn't matter,
+  so Layers 2–3 are optional.
+- **Tier 2 (interactive)** requires L1+L2 and benefits greatly from
+  L3 — real-time latency demands both context management and cache
+  reuse.
+- **Tier 3 (robotics)** requires all three layers under the tightest
+  constraints, plus action-modality prediction on top.
+
+This is why building tier-by-tier validates the serving stack
+incrementally.
+
+### Tier-1 model coverage
+
+A correction from earlier in the session: we initially listed only
+HunyuanVideo 1.5 I2V and Wan-VACE as tier-1 models. In fact, **every
+video generation model in vllm-omni is a tier-1 model** — all inputs
+are known upfront, no real-time constraint. That's 10+ variants across
+three families (LTX-2, Wan 2.1/2.2, HunyuanVideo 1.5), all already
+in-tree. The most important simulation models are already supported.
+
+### What we updated
+
+- `related_works.md`: added Part D (three-tier taxonomy with literature
+  references, model-to-tier mapping, and implications for RFC #1987).
+  Former Part D renamed to Part E. Added section C.5 (serving patterns
+  with explicit sourced-vs-inferred provenance). Expanded tier-1 model
+  table to include all in-tree video models.
