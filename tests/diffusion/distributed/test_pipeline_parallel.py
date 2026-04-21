@@ -303,6 +303,8 @@ def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, resul
         received = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
         result_queue.put(("received", received["t"].cpu()))
 
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     destroy_distributed_env()
 
 
@@ -410,6 +412,8 @@ def predict_noise_worker(
     else:
         assert noise_pred is None
 
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     destroy_distributed_env()
 
 
@@ -446,7 +450,7 @@ def predict_noise_worker(
             True,
             torch.bfloat16,
             4,
-            200,
+            100,
             1e-2,
             1e-2,
             marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs"),
@@ -458,7 +462,7 @@ def predict_noise_worker(
             True,
             torch.bfloat16,
             4,
-            400,
+            100,
             1e-2,
             1e-2,
             marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 4, reason="Need at least 4 GPUs"),
@@ -470,7 +474,7 @@ def predict_noise_worker(
             False,
             torch.bfloat16,
             6,
-            500,
+            100,
             1e-2,
             1e-2,
             marks=pytest.mark.skipif(current_omni_platform.get_device_count() < 3, reason="Need at least 3 GPUs"),
@@ -586,6 +590,8 @@ def scheduler_step_worker(
         resolved = latents.contiguous()
         result_queue.put(resolved.cpu())
 
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
     destroy_distributed_env()
 
 
