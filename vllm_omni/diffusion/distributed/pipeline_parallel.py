@@ -134,6 +134,7 @@ class PipelineParallelMixin:
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = False,
         output_slice: int | None = None,
+        chunk_idx: int | None = None,
     ) -> torch.Tensor | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -168,9 +169,10 @@ class PipelineParallelMixin:
 
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
+        it_name = f"{chunk_idx}_intermediate" if chunk_idx is not None else "intermediate"
         if not pp_group.is_first_rank:
             for i in range(n):
-                handle = pp_group.add_pipeline_recv_dict_task(name="intermediate", segment_idx=i)
+                handle = pp_group.add_pipeline_recv_dict_task(name=it_name, segment_idx=i)
                 its[i] = AsyncIntermediateTensors(handle)
 
         if not pp_group.is_last_rank:
@@ -178,7 +180,7 @@ class PipelineParallelMixin:
             for i, (kwargs, it) in enumerate(zip(all_kwargs, its)):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(
-                    pp_group.pipeline_isend_tensor_dict(result.tensors, name="intermediate", segment_idx=i)
+                    pp_group.pipeline_isend_tensor_dict(result.tensors, name=it_name, segment_idx=i)
                 )
             return None
 
@@ -213,6 +215,7 @@ class PipelineParallelMixin:
         latents: torch.Tensor,
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
+        chunk_idx: int | None = None,
     ) -> torch.Tensor:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -229,10 +232,11 @@ class PipelineParallelMixin:
             return self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
 
         pp_group = get_pp_group()
+        latents_name = f"{chunk_idx}_latents" if chunk_idx is not None else "latents"
         if pp_group.is_last_rank:
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
-            self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name="latents")
+            self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name=latents_name)
         elif pp_group.is_first_rank:
-            handle = pp_group.add_pipeline_recv_dict_task(name="latents")
+            handle = pp_group.add_pipeline_recv_dict_task(name=latents_name)
             latents = AsyncLatents(handle)
         return latents
