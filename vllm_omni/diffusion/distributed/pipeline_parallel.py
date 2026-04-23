@@ -121,10 +121,6 @@ class PipelineParallelMixin:
     def _preposted_its(self, value: list[AsyncIntermediateTensors] | None) -> None:
         self._preposted_its_list = value
 
-    def set_pp_recv_dict_buffers(self, state: Any) -> None:
-        """Override to pre-register PP dict channels for a new request."""
-        return None
-
     def sync_pp_send(self) -> None:
         """
         Wait on all pending non-blocking PP sends.
@@ -227,7 +223,7 @@ class PipelineParallelMixin:
         if output_slice is not None:
             pred = pred[:, :output_slice]
         return pred
-
+    
     def scheduler_step_maybe_with_pp_and_cfg(
         self,
         noise_pred: torch.Tensor | None,
@@ -258,7 +254,10 @@ class PipelineParallelMixin:
             self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name="latents")
         elif pp_group.is_first_rank:
             latents = AsyncLatents(*pp_group.pipeline_irecv_tensor_dict(name="latents", buf_idx=buf_idx))
-
+        return latents
+    
+    def prefetch_its_maybe_with_pp_and_cfg(self, do_true_cfg: bool, buf_idx: int, is_last_step: bool) -> None:
+        pp_group = get_pp_group()
         if not pp_group.is_first_rank and not is_last_step:
             cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
             n = 1 if cfg_parallel_ready else (2 if do_true_cfg else 1)
@@ -271,4 +270,3 @@ class PipelineParallelMixin:
                 )
                 for i in range(n)
             ]
-        return latents
