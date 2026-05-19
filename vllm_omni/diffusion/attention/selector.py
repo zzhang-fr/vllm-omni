@@ -5,7 +5,8 @@ Diffusion attention backend selector.
 
 This module resolves diffusion attention backends from:
 1. per-role AttentionConfig
-2. platform default
+2. plugin-registered name (via register_diffusion_backend)
+3. platform default
 """
 
 from __future__ import annotations
@@ -18,6 +19,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
+)
+from vllm_omni.diffusion.attention.backends.registry import (
+    DiffusionAttentionBackendEnum,
+    resolve_registered_backend,
 )
 
 if TYPE_CHECKING:
@@ -54,10 +59,31 @@ def _cached_get_backend_cls(
 ) -> type[AttentionBackend]:
     """Cache backend class resolution by (backend_name, head_size).
 
-    This ensures platform validation (compute capability checks, package
-    availability, etc.) runs only once per unique (backend_name, head_size)
-    combination, avoiding repeated log messages.
+    Lookup order for a non-None ``backend_name``:
+      1. Built-in :class:`DiffusionAttentionBackendEnum` member —
+         delegated to the platform so hardware validation (compute
+         capability, package availability) is preserved.
+      2. Plugin-registered name from
+         :func:`register_diffusion_backend(name, cls)`.
+      3. Otherwise, fall through to the platform (which will raise
+         with the conventional "unknown backend" error).
+
+    Built-in names win on collision: plugin registration of a name
+    that matches a built-in is rejected at registration time, so no
+    runtime check is needed here.
+
+    Caching ensures platform validation log lines fire at most once per
+    unique (name, head_size) combination.
     """
+    if backend_name is not None:
+        # Plugin path — skip the platform layer entirely, since plugins
+        # are registered with a fully-qualified class path and have no
+        # platform-specific validation.
+        if backend_name.upper() not in DiffusionAttentionBackendEnum.__members__:
+            cls_path = resolve_registered_backend(backend_name)
+            if cls_path is not None:
+                return _load_backend_cls(cls_path)
+
     from vllm_omni.platforms import current_omni_platform
 
     backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
