@@ -14,7 +14,10 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionMetadata,
+    DiffusionAttentionMetadata,
+)
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.parallel import build_parallel_attention_strategy
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -220,6 +223,53 @@ class Attention(nn.Module):
         extra["kv_cache_dtype"] = kv_cache_dtype
         return replace(attn_metadata, extra=extra)
 
+    @staticmethod
+    def _with_diffusion_step_state(
+        attn_metadata: AttentionMetadata | None,
+    ) -> AttentionMetadata | None:
+        """Surface step state from the forward context as typed fields.
+
+        Reads ``denoise_step_idx`` and ``total_denoise_steps`` from the
+        current :class:`ForwardContext` (set by the pipeline before each
+        denoise step) and exposes them on a
+        :class:`DiffusionAttentionMetadata` so any custom attention
+        backend can react to step state without reaching into the forward
+        context itself. If neither is set or the context is unavailable,
+        the metadata passes through unchanged.
+
+        Geometry fields (``total_latent_frames``, ``patches_per_frame``,
+        ``encoder_seq_len``) are not auto-populated here — they're owned
+        by the model author at the attention call site.
+        """
+        if not is_forward_context_available():
+            return attn_metadata
+        ctx = get_forward_context()
+        step_idx = ctx.denoise_step_idx
+        total = ctx.total_denoise_steps
+        if step_idx is None and total is None:
+            return attn_metadata
+        if isinstance(attn_metadata, DiffusionAttentionMetadata):
+            return replace(attn_metadata, denoising_step=step_idx, total_steps=total)
+        if attn_metadata is None:
+            return DiffusionAttentionMetadata(
+                denoising_step=step_idx,
+                total_steps=total,
+            )
+        # Promote a plain AttentionMetadata to DiffusionAttentionMetadata,
+        # preserving every parent field by reflection so future
+        # AttentionMetadata additions don't silently drop.
+        from dataclasses import fields as _fields
+
+        parent_kwargs = {
+            f.name: getattr(attn_metadata, f.name)
+            for f in _fields(AttentionMetadata)
+        }
+        return DiffusionAttentionMetadata(
+            **parent_kwargs,
+            denoising_step=step_idx,
+            total_steps=total,
+        )
+
     def forward(
         self,
         query: torch.Tensor,
@@ -236,6 +286,7 @@ class Attention(nn.Module):
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
 
         attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        attn_metadata = self._with_diffusion_step_state(attn_metadata)
 
         # 2. Kernel Execution (Computation)
         if self.use_ring and strategy is not self._no_parallel_strategy:

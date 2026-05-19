@@ -72,7 +72,10 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
+from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_step_idx,
+    set_forward_context_total_denoise_steps,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
@@ -3031,6 +3034,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             tc_cnt = 0
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            set_forward_context_total_denoise_steps(len(timesteps))
             for i, t in enumerate(timesteps):
                 set_forward_context_denoise_step_idx(i)
                 if cfg_parallel_ready:

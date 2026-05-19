@@ -77,6 +77,41 @@ class AttentionMetadata:
     full_attn_spans: list[list[tuple[int, int]]] | None = None
 
 
+@dataclass
+class DiffusionAttentionMetadata(AttentionMetadata):
+    """Per-forward attention metadata with typed canonical fields for diffusion.
+
+    Adds optional, framework-tracked fields that custom attention backends
+    (and the function-based sparse dispatcher) can read directly instead of
+    inferring from tensor shapes or counting forward calls.
+
+    Writer ownership:
+      - ``denoising_step`` / ``total_steps`` — written by the diffusion
+        model runner at the top of each denoise step. Lets step-aware
+        backends (scheduled topk, mixed-precision policies, …) react to
+        the current iteration without per-block calibration heuristics.
+      - ``total_latent_frames`` / ``patches_per_frame`` / ``encoder_seq_len``
+        — written by the model author at the attention call site, since
+        only the model knows how its (Q, K, V) tensors decompose. Lets
+        plugins that reason about temporal/sequence structure avoid
+        fragile shape arithmetic.
+
+    All fields default to ``None``. Backends MUST silently ignore fields
+    they don't use (same contract as :attr:`AttentionMetadata.extra`).
+    Adding fields in future releases is non-breaking.
+    """
+
+    # Step state — written by the diffusion model runner per step.
+    denoising_step: int | None = None
+    total_steps: int | None = None
+
+    # Sequence geometry — written by the model author at the attention
+    # call site (only the model knows its packing).
+    total_latent_frames: int | None = None
+    patches_per_frame: int | None = None
+    encoder_seq_len: int | None = None
+
+
 T = TypeVar("T", bound=AttentionMetadata)
 
 

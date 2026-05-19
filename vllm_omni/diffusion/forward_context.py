@@ -23,6 +23,10 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
+    # Total number of denoising steps for the current generation. Set once
+    # by the pipeline before its timestep loop so step-aware attention
+    # backends can compute progress fractions, schedule sparsity, etc.
+    total_denoise_steps: int | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -105,6 +109,7 @@ def create_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    total_denoise_steps: int | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
@@ -112,6 +117,7 @@ def create_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        total_denoise_steps=total_denoise_steps,
     )
 
 
@@ -137,6 +143,7 @@ def set_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    total_denoise_steps: int | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -148,6 +155,7 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        total_denoise_steps=total_denoise_steps,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
@@ -171,3 +179,13 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+
+
+def set_forward_context_total_denoise_steps(total_steps: int | None) -> None:
+    """Set the total number of denoising steps on the active ForwardContext.
+
+    Pipelines should call this once before their timestep loop. Step-aware
+    attention backends read it through ``DiffusionAttentionMetadata.total_steps``.
+    """
+    if _forward_context is not None:
+        _forward_context.total_denoise_steps = total_steps
