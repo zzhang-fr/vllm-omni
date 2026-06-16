@@ -10,8 +10,16 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.utils import PPMissingLayer
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_rank,
+    get_pipeline_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from vllm_omni.platforms import current_omni_platform
 
 from .state_lingbot_world_fast import CacheIndex
@@ -466,6 +474,9 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
 
+        self.start_layer = 0
+        self.end_layer = num_layers
+
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
         d = dim // num_heads
@@ -476,6 +487,40 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         # initialize weights
         self.init_weights()
+
+    def apply_pp_split(self) -> None:
+        """Partition the model across PP ranks. Called after weight loading.
+
+        After this returns, blocks outside this rank's [start_layer, end_layer)
+        slice are replaced with PPMissingLayer(); embeddings/head are kept only
+        on the first/last stage. KV-cache sizing (in the pipeline state) reads
+        end_layer - start_layer to allocate just for the owned slice.
+        """
+        pp_world = get_pipeline_parallel_world_size()
+        if pp_world <= 1:
+            self.start_layer = 0
+            self.end_layer = self.num_layers
+            return
+
+        rank = get_pipeline_parallel_rank()
+        per_rank = self.num_layers // pp_world
+        rem = self.num_layers % pp_world
+        # Even split: extra layers go to the first `rem` ranks.
+        self.start_layer = rank * per_rank + min(rank, rem)
+        self.end_layer = self.start_layer + per_rank + (1 if rank < rem else 0)
+
+        for i in range(self.num_layers):
+            if not (self.start_layer <= i < self.end_layer):
+                self.blocks[i] = PPMissingLayer()
+
+        if not is_pipeline_first_stage():
+            self.patch_embedding = PPMissingLayer()
+            self.patch_embedding_wancamctrl = PPMissingLayer()
+            self.c2ws_hidden_states_layer1 = PPMissingLayer()
+            self.c2ws_hidden_states_layer2 = PPMissingLayer()
+
+        if not is_pipeline_last_stage():
+            self.head = PPMissingLayer()
 
     def forward(
         self,
@@ -491,6 +536,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         crossattn_cache=None,
         current_start=0,
         max_attention_size=1_000_000,
+        intermediate_tensors: IntermediateTensors | None = None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -531,24 +577,32 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
 
-        if self.task_type == "i2v":
+        if self.task_type == "i2v" and is_pipeline_first_stage():
             assert y is not None
 
         # params
-        device = self.patch_embedding.weight.device
+        first_stage = is_pipeline_first_stage()
+        last_stage = is_pipeline_last_stage()
+
+        first_param = next(self.parameters())
+        device = first_param.device
+
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        if is_pipeline_first_stage():
+            if y is not None:
+                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat(x)
+            # embeddings
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat(x)
+        else:
+            assert intermediate_tensors is not None, "non-first PP stage requires intermediate_tensors"
 
         # time embeddings
         if t.dim() == 1:
@@ -567,28 +621,31 @@ class WanModelFast(ModelMixin, ConfigMixin):
         )
 
         # cam
-        if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
-            c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
-            c2ws_plucker_emb = [
-                rearrange(
-                    i,
-                    "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
-                    c1=self.patch_size[0],
-                    c2=self.patch_size[1],
-                    c3=self.patch_size[2],
+        if first_stage:
+            if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+                c2ws_plucker_emb = dit_cond_dict["c2ws_plucker_emb"]
+                c2ws_plucker_emb = [
+                    rearrange(
+                        i,
+                        "1 c (f c1) (h c2) (w c3) -> 1 (f h w) (c c1 c2 c3)",
+                        c1=self.patch_size[0],
+                        c2=self.patch_size[1],
+                        c3=self.patch_size[2],
+                    )
+                    for i in c2ws_plucker_emb
+                ]
+                c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+
+                c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
+                c2ws_hidden_states = self.c2ws_hidden_states_layer2(
+                    torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
                 )
-                for i in c2ws_plucker_emb
-            ]
-            c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=1)  # [1, (L1+...+Ln), C]
+                dit_cond_dict = dict(dit_cond_dict)
+                dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
+        else:
+            if "c2ws_plucker_emb" in intermediate_tensors.tensors:
+                dit_cond_dict = {"c2ws_plucker_emb": intermediate_tensors["c2ws_plucker_emb"]}
 
-            c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
-            c2ws_hidden_states = self.c2ws_hidden_states_layer2(
-                torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb))
-            )
-            dit_cond_dict = dict(dit_cond_dict)
-            dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
-
-        # arguments
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens,
@@ -600,7 +657,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
             max_attention_size=max_attention_size,
         )
 
-        for block_index, block in enumerate(self.blocks):
+        for block_index, block in enumerate(self.blocks[self.start_layer : self.end_layer]):
             kwargs.update(
                 {
                     "kv_cache": kv_cache[block_index],
@@ -611,6 +668,17 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 }
             )
             x = block(x, **kwargs)
+
+        if not last_stage:
+            model_dtype = next(self.parameters()).dtype
+            it = {
+                "hidden_states": x.to(model_dtype),
+                "grid_sizes": grid_sizes,
+                "seq_lens": seq_lens,
+            }
+            if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+                it["c2ws_plucker_emb"] = dit_cond_dict["c2ws_plucker_emb"].to(model_dtype)
+            return IntermediateTensors(it)
 
         # head
         x = self.head(x, e)
