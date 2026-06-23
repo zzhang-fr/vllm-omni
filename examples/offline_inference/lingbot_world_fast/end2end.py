@@ -18,6 +18,7 @@ import numpy as np
 import PIL.Image
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -43,6 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames.")
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=16, help="Frames per second for the output video.")
+    parser.add_argument(
+        "--pipeline-parallel-size", type=int, default=1, help="Number of GPUs across which to divide the model layers"
+    )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
@@ -91,9 +95,11 @@ def main():
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
+    parallel_config = DiffusionParallelConfig(pipeline_parallel_size=args.pipeline_parallel_size)
+
     omni = Omni(
         model=args.model,
-        parallel_config=None,
+        parallel_config=parallel_config,
         model_class_name=model_class_name,
         stage_init_timeout=6000,
         init_timeout=6000,

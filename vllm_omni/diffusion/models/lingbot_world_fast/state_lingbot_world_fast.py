@@ -42,7 +42,7 @@ class LingbotWorldFastState:
             for cache in self.kv_cache:
                 del cache
             for cache in self.crossattn_cache:
-                if isinstance(cache["k"], torch.Tensor):
+                if isinstance(cache.get("k", None), torch.Tensor):
                     del cache["k"]
                     del cache["v"]
 
@@ -57,7 +57,8 @@ class LingbotWorldFastState:
         self.session_id: str | None = None
 
         self.batch_size: int | None = None
-        self.num_layers: int | None = None
+        self.start_layer: int | None = None
+        self.end_layer: int | None = None
         self.num_heads: int | None = None
         self.head_dim: int | None = None
 
@@ -86,25 +87,33 @@ class LingbotWorldFastState:
         dtype: torch.dtype,
         device: torch.device,
         kv_size: int,
-        num_layers: int,
+        start_layer: int,
+        end_layer: int,
         num_heads: int,
         head_dim: int,
     ) -> None:
         self.batch_size = batch_size
-        self.num_layers = num_layers
+        self.start_layer = start_layer
+        self.end_layer = end_layer
         self.num_heads = num_heads
         self.head_dim = head_dim
 
         """Initialize empty KV caches and cross-attention caches."""
-        self.kv_cache = [
+        self.kv_cache = [() for _ in range(start_layer)] + [
             torch.zeros(2, batch_size, kv_size, num_heads, head_dim, dtype=dtype, device=device)
-            for _ in range(num_layers)
+            for _ in range(start_layer, end_layer)
         ]
 
-        self.local_end_index = [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_layers)]
-        self.global_end_index = [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_layers)]
+        self.local_end_index = [() for _ in range(start_layer)] + [
+            torch.tensor([0], dtype=torch.long, device=device) for _ in range(start_layer, end_layer)
+        ]
+        self.global_end_index = [() for _ in range(start_layer)] + [
+            torch.tensor([0], dtype=torch.long, device=device) for _ in range(start_layer, end_layer)
+        ]
 
-        self.crossattn_cache = [{"is_init": False, "k": None, "v": None} for _ in range(num_layers)]
+        self.crossattn_cache = [{} for _ in range(start_layer)] + [
+            {"is_init": False, "k": None, "v": None} for _ in range(start_layer, end_layer)
+        ]
 
         self.is_initialized = True
 
@@ -114,7 +123,7 @@ class LingbotWorldFastState:
         dtype = self.kv_cache[0].dtype
         device = self.kv_cache[0].device
 
-        self.kv_cache = [
+        self.kv_cache = [() for i in range(self.start_layer)] + [
             torch.cat(
                 [
                     self.kv_cache[i],
@@ -124,7 +133,7 @@ class LingbotWorldFastState:
                 ],
                 dim=2,
             )
-            for i in range(self.num_layers)
+            for i in range(self.start_layer, self.end_layer)
         ]
 
     def update_kv_cache(self, layer_index: int, updated_kv: torch.Tensor) -> None:
@@ -137,7 +146,7 @@ class LingbotWorldFastState:
         assert self.kv_cache is not None, "KV caches not initialized"
         return self.kv_cache
 
-    def get_crossattn_caches(self) -> list[dict[str, bool | torch.Tensor | None]]:
+    def get_crossattn_cache(self) -> list[dict[str, bool | torch.Tensor | None]]:
         """Get cross-attention caches for the specified branch."""
         assert self.crossattn_cache is not None, "Cross-attn caches not initialized"
         return self.crossattn_cache

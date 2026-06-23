@@ -6,6 +6,7 @@ import sys
 import time
 from collections.abc import Iterable
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
@@ -17,9 +18,16 @@ from torch import nn
 from tqdm import tqdm
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_world_size,
+    get_pp_group,
+    is_pipeline_first_stage,
+)
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
@@ -31,6 +39,7 @@ from .cam_utils import (
     get_plucker_embeddings,
     interpolate_camera_poses,
 )
+from .flow_scheduler import LingbotFlowScheduler
 from .fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .state_lingbot_world_fast import LingbotWorldFastState
 from .wan_fast import WanModelFast
@@ -73,7 +82,9 @@ def get_lingbot_world_fast_post_process_func(
     return post_process_func
 
 
-class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInput, CFGParallelMixin):
+class LingbotWorldFastPipeline(
+    nn.Module, SupportImageInput, SupportCameraPosInput, PipelineParallelMixin, CFGParallelMixin
+):
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
         self.od_config = od_config
@@ -86,7 +97,8 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         self.control_type = "cam"
         self.num_train_timesteps = CONFIG["num_train_timesteps"]
 
-        self.sp_size = od_config.parallel_config.world_size
+        self.pp_size = od_config.parallel_config.pipeline_parallel_size
+        self.sp_size = 1
 
         self.state = LingbotWorldFastState()
 
@@ -110,6 +122,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
         self.vae = AutoencoderKLWan()
         # The checkpoint is in Wan's naming, not diffusers' — remap before loading.
+        # TODO: load the encoder only on first statge and the decoder only in the last stage
         self.vae.load_state_dict(_wan_vae_to_diffusers_state_dict(vae_sd), assign=True)
         self.vae = self.vae.to(self.device)
 
@@ -145,7 +158,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             ),
         ]
 
-        self.scheduler = FlowUniPCMultistepScheduler(
+        self.base_scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.num_train_timesteps, shift=1, use_dynamic_shifting=False
         )
 
@@ -188,10 +201,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         return x0_pred.to(original_dtype)
 
-    def forward(
-        self,
-        req: OmniDiffusionRequest,
-    ) -> DiffusionOutput:
+    def forward(self, req: OmniDiffusionRequest, output_type: str | None = "np") -> DiffusionOutput:
         if len(req.prompts) > 1:
             raise ValueError(
                 """This model only supports a single prompt, not a batched request.""",
@@ -301,8 +311,9 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             msk = torch.zeros(4, new_lat_f, lat_h, lat_w, device=self.device)
 
         # 2. Prepare timesteps
-        self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
-        timesteps = self.scheduler.timesteps[CONFIG["timesteps_index"]]
+        self.base_scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
+        timesteps = self.base_scheduler.timesteps[CONFIG["timesteps_index"]]
+        self.scheduler = LingbotFlowScheduler(self.base_scheduler, timesteps.to(self.device))
 
         context = self.encode_prompt([prompt], self.device)
         context = [t.to(self.device) for t in context]
@@ -387,7 +398,8 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 transformer_dtype,
                 self.device,
                 extra_kv_size,
-                model_args.num_layers,
+                self.model.start_layer,
+                self.model.end_layer,
                 local_num_heads,
                 head_dim,
             )
@@ -423,53 +435,26 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 }
 
                 kwargs = {
+                    "current_latent": current_latent,
+                    "timesteps": timesteps,
                     "context": [context[0]],
                     "seq_len": max_seq_len,
                     "y": [current_condition],
                     "dit_cond_dict": dit_cond_dict,
-                    "kv_cache": self.state.get_kv_cache(),
-                    "local_end_index": self.state.local_end_index,
-                    "global_end_index": self.state.global_end_index,
-                    "crossattn_cache": self.state.get_crossattn_caches(),
                     "current_start": start_token_offset + chunk_id * latent_frames_per_chunk * frame_seqlen,
                     "max_attention_size": total_kv_size,
+                    "pred_latent_chunks": pred_latent_chunks,
+                    "seed_g": seed_g,
                 }
 
-                for timestep_idx in range(len(timesteps)):
-                    latent_model_input = [current_latent.to(self.device)]
-                    current_timestep = [timesteps[timestep_idx]]
+                latents = self.diffuse(**kwargs)
 
-                    timestep = torch.stack(current_timestep).to(self.device)
+            output = None
+            if output_type == "latent":
+                output = latents
+            elif is_pipeline_first_stage():
+                pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
-                    noise_pred = self.model(x=latent_model_input, t=timestep, **kwargs)[0]
-
-                    x0 = self._convert_flow_pred_to_x0(
-                        flow_pred=noise_pred,
-                        xt=current_latent,
-                        timestep=current_timestep[0],
-                        scheduler=self.scheduler,
-                    )
-
-                    if timestep_idx < len(timesteps) - 1:
-                        next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(
-                            x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep
-                        )
-                    else:
-                        # note return x0
-                        break
-
-                pred_latent_chunks.append(x0)
-
-                # Update kv cache
-                context_timestep = [timesteps[-1] * 0.0]
-                timestep = torch.stack(context_timestep).to(self.device)
-                self.model(x=[x0], t=timestep, **kwargs)
-
-            pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
-
-            videos = None
-            if self.device.index == 0:
                 # Wan VAE decode() calls clear_cache() internally, so the very first latent always runs the i==0 path
                 # (no temporal upsample, single-frame output) and leaves feat_map polluted with thatbias.
                 # The decoder's stacked temporal-causal layers also need ~2 latents of streaming context before deeper
@@ -487,6 +472,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                     videos = self.decode_video([pred_latent_chunks])
 
                 self.state.last_decoded_latent = pred_latent_chunks[:, -2:].detach().clone()
+                output = videos[0]
 
         if dist.is_initialized():
             dist.barrier()
@@ -499,7 +485,101 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             self.state.frame_seqlen = frame_seqlen
         self.state.advance(new_lat_f)
 
-        return DiffusionOutput(output=videos[0])
+        return DiffusionOutput(output=output)
+
+    def diffuse(
+        self,
+        timesteps,
+        current_latent,
+        context,
+        seq_len,
+        y,
+        dit_cond_dict,
+        current_start,
+        max_attention_size,
+        pred_latent_chunks,
+        seed_g,
+    ):
+        kwargs = {
+            "context": context,
+            "seq_len": seq_len,
+            "y": y,
+            "dit_cond_dict": dit_cond_dict,
+            "kv_cache": self.state.get_kv_cache(),
+            "local_end_index": self.state.local_end_index,
+            "global_end_index": self.state.global_end_index,
+            "crossattn_cache": self.state.get_crossattn_cache(),
+            "current_start": current_start,
+            "max_attention_size": max_attention_size,
+        }
+
+        for timestep_idx in range(len(timesteps)):
+            # latent_model_input = [current_latent.to(self.device)]
+            current_timestep = [timesteps[timestep_idx]]
+
+            timestep = torch.stack(current_timestep).to(self.device)
+
+            kwargs["x"] = [current_latent]
+            kwargs["t"] = timestep
+
+            # noise_pred = self.model(x=latent_model_input, t=timestep, **kwargs)[0]
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=False,
+                positive_kwargs=kwargs,
+                negative_kwargs=None,
+                cfg_normalize=False,
+                true_cfg_scale=0.0,
+            )
+
+            current_latent = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, current_latent, do_true_cfg=False)
+
+        if get_pipeline_parallel_world_size() > 1:
+            pp_group = get_pp_group()
+            if pp_group.is_last_rank:
+                # Broadcast to other GPUs. Clean latents needed to update KV cache
+                for dst in range(get_pipeline_parallel_world_size() - 1):
+                    pp_group.isend_tensor_dict({"latents": current_latent}, dst=dst)
+                x0 = current_latent
+            else:
+                resp_dict = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
+                x0 = resp_dict._resolve()
+        else:
+            x0 = current_latent
+        pred_latent_chunks.append(x0)
+
+        # Update kv cache
+        context_timestep = [timesteps[-1] * 0.0]
+        timestep = torch.stack(context_timestep).to(self.device)
+
+        kwargs["x"] = [x0]
+        kwargs["t"] = timestep
+
+        noise_pred = self.predict_noise_maybe_with_cfg(
+            do_true_cfg=False,
+            positive_kwargs=kwargs,
+            negative_kwargs=None,
+            cfg_normalize=False,
+            true_cfg_scale=0.0,
+        )
+
+        return current_latent
+
+    def predict_noise(
+        self,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
+        """
+        Forward pass through transformer to predict noise.
+
+        Args:
+            current_model: The transformer model to use (transformer or transformer_2)
+            **kwargs: Arguments to pass to the transformer
+
+        Returns:
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
+        """
+        result = self.model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
@@ -532,9 +612,10 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
     def decode_video(self, zs: list[torch.Tensor]):
         mean, inv_std = self.latents_scale
         out = []
+
         for u in zs:
             z = u.unsqueeze(0) / inv_std + mean
-            sample = self.vae.decode(z, return_dict=False)[0]
+            sample = self.vae._decode(z, return_dict=False)[0]
             out.append(sample.float().clamp_(-1, 1).squeeze(0))
         return out
 

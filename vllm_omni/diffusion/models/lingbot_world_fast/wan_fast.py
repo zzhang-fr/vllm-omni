@@ -1,6 +1,7 @@
 """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
 
 import math
+from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
@@ -10,8 +11,16 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.utils import (
+    is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
+    make_layers,
+)
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from vllm_omni.platforms import current_omni_platform
 
 from .state_lingbot_world_fast import CacheIndex
@@ -223,7 +232,15 @@ class WanCrossAttention(nn.Module):
 
 class CausalWanAttentionBlock(nn.Module):
     def __init__(
-        self, dim, ffn_dim, num_heads, local_attn_size=-1, sink_size=0, qk_norm=True, cross_attn_norm=False, eps=1e-6
+        self,
+        dim,
+        ffn_dim,
+        num_heads,
+        local_attn_size=-1,
+        sink_size=0,
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
     ):
         super().__init__()
         self.dim = dim
@@ -454,13 +471,18 @@ class WanModelFast(ModelMixin, ConfigMixin):
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
 
         # blocks
-        self.blocks = nn.ModuleList(
-            [
-                CausalWanAttentionBlock(
-                    dim, ffn_dim, num_heads, local_attn_size, sink_size, qk_norm, cross_attn_norm, eps
-                )
-                for _ in range(num_layers)
-            ]
+        self.start_layer, self.end_layer, self.blocks = make_layers(
+            num_layers,
+            lambda prefix: CausalWanAttentionBlock(
+                dim, ffn_dim, num_heads, local_attn_size, sink_size, qk_norm, cross_attn_norm, eps
+            ),
+            prefix="blocks",
+        )
+
+        # Tensors have different dimensions, so we let them be created empty and
+        # allocated only when necessary and with the correct dimensions
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["x", "grid_sizes", "seq_lens"], 0
         )
 
         # head
@@ -491,6 +513,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         crossattn_cache=None,
         current_start=0,
         max_attention_size=1_000_000,
+        intermediate_tensors: IntermediateTensors = None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -531,7 +554,10 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
 
-        if self.task_type == "i2v":
+        first_stage = is_pipeline_first_stage()
+        last_stage = is_pipeline_last_stage()
+
+        if first_stage and self.task_type == "i2v":
             assert y is not None
 
         # params
@@ -539,16 +565,24 @@ class WanModelFast(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+        if first_stage:
+            if y is not None:
+                x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
-        # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
-        x = [u.flatten(2).transpose(1, 2) for u in x]
-        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
-        x = torch.cat(x)
+            # embeddings
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+            grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+            x = [u.flatten(2).transpose(1, 2) for u in x]
+            seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+            assert seq_lens.max() <= seq_len
+            x = torch.cat(x)
+        else:
+            if intermediate_tensors is None:
+                raise RuntimeError("intermediate_tensors must be provided for non-first PP stages")
+
+            x = intermediate_tensors["x"]
+            grid_sizes = intermediate_tensors["grid_sizes"]
+            seq_lens = intermediate_tensors["seq_lens"]
 
         # time embeddings
         if t.dim() == 1:
@@ -600,7 +634,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
             max_attention_size=max_attention_size,
         )
 
-        for block_index, block in enumerate(self.blocks):
+        for block_index in range(self.start_layer, self.end_layer):
+            block = self.blocks[block_index]
             kwargs.update(
                 {
                     "kv_cache": kv_cache[block_index],
@@ -611,6 +646,17 @@ class WanModelFast(ModelMixin, ConfigMixin):
                 }
             )
             x = block(x, **kwargs)
+
+        if not last_stage:
+            model_dtype = next(self.parameters()).dtype
+            it = {
+                "x": x.to(model_dtype),
+                "grid_sizes": grid_sizes,
+                "seq_lens": seq_lens,
+            }
+            if dit_cond_dict is not None and "c2ws_plucker_emb" in dit_cond_dict:
+                it["c2ws_plucker_emb"] = dit_cond_dict["c2ws_plucker_emb"].to(model_dtype)
+            return IntermediateTensors(it)
 
         # head
         x = self.head(x, e)
@@ -668,3 +714,17 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            if is_pp_missing_parameter(name, self) or name not in params_dict:
+                continue
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
