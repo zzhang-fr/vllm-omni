@@ -514,7 +514,6 @@ class LingbotWorldFastPipeline(
         }
 
         for timestep_idx in range(len(timesteps)):
-            # latent_model_input = [current_latent.to(self.device)]
             current_timestep = [timesteps[timestep_idx]]
 
             timestep = torch.stack(current_timestep).to(self.device)
@@ -522,7 +521,6 @@ class LingbotWorldFastPipeline(
             kwargs["x"] = [current_latent]
             kwargs["t"] = timestep
 
-            # noise_pred = self.model(x=latent_model_input, t=timestep, **kwargs)[0]
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=False,
                 positive_kwargs=kwargs,
@@ -533,19 +531,21 @@ class LingbotWorldFastPipeline(
 
             current_latent = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, current_latent, do_true_cfg=False)
 
+        x0 = None
+
         if get_pipeline_parallel_world_size() > 1:
             pp_group = get_pp_group()
             if pp_group.is_last_rank:
-                # Broadcast to other GPUs. Clean latents needed to update KV cache
-                for dst in range(get_pipeline_parallel_world_size() - 1):
-                    pp_group.isend_tensor_dict({"latents": current_latent}, dst=dst)
+                # Clean latents needed to update KV cache
+                pp_group.isend_tensor_dict({"latents": current_latent}, dst=0)
                 x0 = current_latent
-            else:
+            if pp_group.is_first_rank:
                 resp_dict = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
                 x0 = resp_dict._resolve()
+                pred_latent_chunks.append(x0)
         else:
             x0 = current_latent
-        pred_latent_chunks.append(x0)
+            pred_latent_chunks.append(x0)
 
         # Update kv cache
         context_timestep = [timesteps[-1] * 0.0]
