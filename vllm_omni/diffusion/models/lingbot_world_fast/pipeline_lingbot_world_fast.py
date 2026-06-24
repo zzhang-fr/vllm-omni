@@ -24,10 +24,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
-    get_pp_group,
     is_pipeline_first_stage,
 )
-from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
@@ -122,7 +121,6 @@ class LingbotWorldFastPipeline(
         vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
         self.vae = AutoencoderKLWan()
         # The checkpoint is in Wan's naming, not diffusers' — remap before loading.
-        # TODO: load the encoder only on first statge and the decoder only in the last stage
         self.vae.load_state_dict(_wan_vae_to_diffusers_state_dict(vae_sd), assign=True)
         self.vae = self.vae.to(self.device)
 
@@ -531,27 +529,14 @@ class LingbotWorldFastPipeline(
 
             current_latent = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, current_latent, do_true_cfg=False)
 
-        x0 = None
-
-        if get_pipeline_parallel_world_size() > 1:
-            pp_group = get_pp_group()
-            if pp_group.is_last_rank:
-                # Clean latents needed to update KV cache
-                pp_group.isend_tensor_dict({"latents": current_latent}, dst=0)
-                x0 = current_latent
-            if pp_group.is_first_rank:
-                resp_dict = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
-                x0 = resp_dict._resolve()
-                pred_latent_chunks.append(x0)
-        else:
-            x0 = current_latent
-            pred_latent_chunks.append(x0)
+        if get_pipeline_parallel_world_size() == 1 or is_pipeline_first_stage():
+            pred_latent_chunks.append(current_latent)
 
         # Update kv cache
         context_timestep = [timesteps[-1] * 0.0]
         timestep = torch.stack(context_timestep).to(self.device)
 
-        kwargs["x"] = [x0]
+        kwargs["x"] = [current_latent]
         kwargs["t"] = timestep
 
         noise_pred = self.predict_noise_maybe_with_cfg(
