@@ -117,22 +117,26 @@ class LingbotWorldFastPipeline(
         self.vae_stride = od_config.model_config["vae_stride"]
         self.patch_size = od_config.model_config["patch_size"]
 
-        vae_path = os.path.join(model_path, CONFIG["vae_checkpoint"])
-        vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
-        self.vae = AutoencoderKLWan()
-        # The checkpoint is in Wan's naming, not diffusers' — remap before loading.
-        self.vae.load_state_dict(_wan_vae_to_diffusers_state_dict(vae_sd), assign=True)
-        self.vae = self.vae.to(self.device)
+        self.vae = None
+        self.latents_scale = None
 
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(self.vae.device, self.vae.dtype)
-        )
-        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-            self.vae.device, self.vae.dtype
-        )
-        self.latents_scale = [latents_mean, latents_std]
+        if is_pipeline_first_stage():
+            vae_path = os.path.join(model_path, CONFIG["vae_checkpoint"])
+            vae_sd = torch.load(vae_path, map_location="cpu", weights_only=True)
+            self.vae = AutoencoderKLWan()
+            # The checkpoint is in Wan's naming, not diffusers' — remap before loading.
+            self.vae.load_state_dict(_wan_vae_to_diffusers_state_dict(vae_sd), assign=True)
+            self.vae = self.vae.to(self.device)
+
+            latents_mean = (
+                torch.tensor(self.vae.config.latents_mean)
+                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .to(self.vae.device, self.vae.dtype)
+            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+                self.vae.device, self.vae.dtype
+            )
+            self.latents_scale = [latents_mean, latents_std]
 
         logger.info(f"Creating WanModelFast from {model_path}")
 
@@ -298,7 +302,9 @@ class LingbotWorldFastPipeline(
         # Fresh: msk[0] = 1 (anchor) and the rest = 0, replicated into 4 channels grouped
         # by latent frame to give shape [4, new_lat_f, lat_h, lat_w].
         # Extension: no anchor, all zeros, already in the [4, new_lat_f, ...] layout.
-        if not extension:
+        if not is_pipeline_first_stage():
+            pass
+        elif not extension:
             F = (new_lat_f - 1) * 4 + 1
             msk = torch.zeros(1, F, lat_h, lat_w, device=self.device)
             msk[:, 0] = 1
@@ -352,6 +358,8 @@ class LingbotWorldFastPipeline(
             self.target_dtype
         )
 
+        y = None
+
         # Fresh:     pixels = [anchor_image, zeros...] of shape [3, 4N+1, h, w].
         #            VAE produces N+1 latents; latent[0] is the anchor encoding.
         # Extension: pixels = zeros [3, 4N+1, h, w]. VAE produces N+1 latents,
@@ -359,7 +367,9 @@ class LingbotWorldFastPipeline(
         #            (biased differently than the regular 4-frame-group latents).
         #            Slice it off so the N conditioning slots are all regular —
         #            this drops a CONDITIONING slot, not an output latent.
-        if not extension:
+        if not is_pipeline_first_stage():
+            pass
+        elif not extension:
             F = (new_lat_f - 1) * 4 + 1
             pixels = torch.concat(
                 [
@@ -369,10 +379,11 @@ class LingbotWorldFastPipeline(
                 dim=1,
             ).to(self.device)
             y = self.encode_video([pixels])[0]
+            y = torch.concat([msk, y])
         else:
             pixels = torch.zeros(3, 4 * new_lat_f + 1, h, w, device=self.device)
             y = self.encode_video([pixels])[0][:, 1:]
-        y = torch.concat([msk, y])
+            y = torch.concat([msk, y])
 
         @contextmanager
         def noop_no_sync():
@@ -419,13 +430,13 @@ class LingbotWorldFastPipeline(
             # sample videos
             latent = noise
             latents_chunk = latent.split(latent_frames_per_chunk, dim=1)  # [c, f, h, w]
-            condition_chunk = y.split(latent_frames_per_chunk, dim=1)
+            condition_chunk = y.split(latent_frames_per_chunk, dim=1) if y is not None else None
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(latent_frames_per_chunk, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
             for chunk_id in tqdm(range(num_inference_chunk)):
                 current_latent = latents_chunk[chunk_id]
-                current_condition = condition_chunk[chunk_id]
+                current_condition = condition_chunk[chunk_id] if condition_chunk is not None else None
                 current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
 
                 dit_cond_dict = {
