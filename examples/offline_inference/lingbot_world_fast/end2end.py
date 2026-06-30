@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="If set to false (default) will compile kernels before running the model",
+    )
     return parser.parse_args()
 
 
@@ -103,6 +108,7 @@ def main():
         model_class_name=model_class_name,
         stage_init_timeout=6000,
         init_timeout=6000,
+        enforce_eager=args.enforce_eager,
     )
 
     if profiler_enabled:
@@ -128,27 +134,28 @@ def main():
 
         multi_modal_data["camera"] = {"poses": poses, "intrinsics": intrinsics}
 
-    generation_start = time.perf_counter()
-    frames = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-            "multi_modal_data": multi_modal_data,
-        },
-        OmniDiffusionSamplingParams(
-            height=height,
-            width=width,
-            generator=generator,
-            num_frames=args.num_frames,
-            frame_rate=args.fps,
-            extra_args={"session_id": "offline_generation"},
-        ),
-    )
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
+    for i in range(5):
+        generation_start = time.perf_counter()
+        frames = omni.generate(
+            {
+                "prompt": args.prompt,
+                "negative_prompt": args.negative_prompt,
+                "multi_modal_data": multi_modal_data,
+            },
+            OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                generator=generator,
+                num_frames=args.num_frames,
+                frame_rate=args.fps,
+                extra_args={"session_id": f"offline_generation_{i}"},
+            ),
+        )
+        generation_end = time.perf_counter()
+        generation_time = generation_end - generation_start
 
-    # Print profiling results
-    print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+        # Print profiling results
+        print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     if isinstance(frames, list):
         frames = frames[0] if frames else None

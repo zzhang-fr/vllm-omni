@@ -30,6 +30,7 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import PipelineParallelMi
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
+from vllm_omni.diffusion.models.lingbot_world_fast.wan_vae_feat_cache_patch import apply_wan_vae_feat_cache_tensor_patch
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .cam_utils import (
@@ -574,14 +575,111 @@ class LingbotWorldFastPipeline(
         Returns:
             Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
-        result = self.model(**kwargs)
+        result = self._predict_noise_eager(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def _predict_noise_eager(
+        self,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._cudagraph_mark_step_begin()
+        result = self.model(**kwargs)
+
+        if isinstance(result, IntermediateTensors):
+            return result
+
+        return result
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
 
+    def setup_compile(self) -> None:
+        if not torch.cuda.is_available():
+            logger.info("Lingbot World Fast setup_compile skipped: CUDA not available.")
+            return
+
+        apply_wan_vae_feat_cache_tensor_patch()
+
+        compile_ro = {"mode": "reduce-overhead", "fullgraph": True, "dynamic": False}
+        # DiT blocks: default avoids CUDAGraph overwrite on modulation tensors; encoders use reduce-overhead.
+        dit_compile = {"mode": "default", "fullgraph": False, "dynamic": False}
+
+        logger.info("Lingbot World Fast: Compiling pipeline.")
+
+        try:
+            self.text_encoder.forward = torch.compile(self.text_encoder.forward, **compile_ro)
+        except Exception as exc:
+            logger.warning("Lingbot World Fast: text_encoder compile failed (%s); skipping.", exc)
+
+        if self.vae is not None:
+            try:
+                self.vae.encode = torch.compile(self.vae.encode, **compile_ro)
+                self.vae.decode = torch.compile(self.vae.decode, **compile_ro)
+            except Exception as exc:
+                logger.warning("Lingbot World Fast: vae.encode compile failed (%s); skipping.", exc)
+
+        compiled_blocks = 0
+        for block in self.model.blocks:
+            try:
+                block.forward = torch.compile(block.forward, **dit_compile)
+                compiled_blocks += 1
+            except Exception as exc:
+                logger.warning(
+                    "Lingbot World Fast: transformer block %d compile failed (%s); leaving remaining eager.",
+                    compiled_blocks,
+                    exc,
+                )
+                break
+        if compiled_blocks:
+            logger.info(
+                "Lingbot World Fast: compiled %d/%d transformer blocks.",
+                compiled_blocks,
+                len(self.model.blocks),
+            )
+
+        self.warmup_compile()
+
+    def warmup_compile(self) -> None:
+        """Warm up compiled text/image/VAE paths before timed inference."""
+        if not torch.cuda.is_available():
+            return
+
+        device = next(self.text_encoder.parameters()).device
+        with torch.inference_mode():
+            try:
+                self.encode_prompt(["warmup prompt"], self.device)
+            except Exception as exc:
+                logger.warning("Lingbot World Fast compile warmup (text_encoder) skipped: %s", exc)
+
+            try:
+                image = torch.zeros(3, 5, 480, 832, device=self.device)
+                self.encode_video([image])
+            except Exception as exc:
+                logger.warning("Lingbot World Fast compile warmup (vae) skipped: %s", exc)
+
+            try:
+                latent_h, latent_w = 180 // 8, 320 // 8
+                dummy_latent = torch.zeros(
+                    1,
+                    16,
+                    self.od_config.model_config["latent_frames_per_chunk"],
+                    latent_h * 2,
+                    latent_w * 2,
+                    dtype=self.vae.dtype,
+                    device=device,
+                )
+                dummy_latent_denorm = dummy_latent / self.latents_scale[1] + self.latents_scale[0]
+                self._cudagraph_mark_step_begin()
+                self.vae.decode(dummy_latent_denorm, return_dict=False)
+            except Exception as exc:
+                logger.warning("Lingbot World Fast compile warmup (vae decode) skipped: %s", exc)
+
+        torch.accelerator.synchronize(device)
+        logger.info("Lingbot World Fast compile warmup finished (text / image / vae decode).")
+
     def encode_prompt(self, texts: list[str], device: torch.device):
+        self._cudagraph_mark_step_begin()
         inputs = self.tokenizer(
             texts,
             padding=True,
@@ -592,20 +690,23 @@ class LingbotWorldFastPipeline(
         mask = inputs.attention_mask.to(device)
         seq_lens = mask.gt(0).sum(dim=1).long()
         context = self.text_encoder(input_ids=ids, attention_mask=mask).last_hidden_state
+        context = context.clone()
         return [u[:v] for u, v in zip(context, seq_lens)]
 
     def encode_video(self, videos: list[torch.Tensor]):
+        self._cudagraph_mark_step_begin()
         mean, inv_std = self.latents_scale  # [latents_mean, 1/std], shapes (1, z, 1, 1, 1)
         out = []
         for u in videos:
             # AutoencoderKLWan.encode -> AutoencoderKLOutput; the custom Wan2_1_VAE.encode
             # returns the deterministic posterior mean (mu, no sampling), so use .mode().
-            mu = self.vae.encode(u.unsqueeze(0)).latent_dist.mode()
+            mu = self.vae.encode(u.unsqueeze(0)).latent_dist.mode().clone()
             mu = (mu - mean) * inv_std
             out.append(mu.float().squeeze(0))
         return out
 
     def decode_video(self, zs: list[torch.Tensor]):
+        self._cudagraph_mark_step_begin()
         mean, inv_std = self.latents_scale
         out = []
 
@@ -614,6 +715,13 @@ class LingbotWorldFastPipeline(
             sample = self.vae._decode(z, return_dict=False)[0]
             out.append(sample.float().clamp_(-1, 1).squeeze(0))
         return out
+
+    @staticmethod
+    def _cudagraph_mark_step_begin() -> None:
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
 
 
 def _wan_t5_to_hf_state_dict(sd: dict) -> dict:

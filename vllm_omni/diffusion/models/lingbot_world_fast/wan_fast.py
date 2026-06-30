@@ -43,9 +43,9 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
         freqs_i = torch.cat(
             [
-                freqs[0][start_frame : start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+                freqs[0][start_frame : start_frame + f].clone().view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].clone().view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].clone().view(1, 1, w, -1).expand(f, h, w, -1),
             ],
             dim=-1,
         ).reshape(seq_len, 1, -1)
@@ -93,11 +93,11 @@ class CausalWanSelfAttention(nn.Module):
         seq_lens,
         grid_sizes,
         freqs,
-        kv_cache=None,
-        local_end_index=None,
-        global_end_index=None,
-        current_start=0,
-        max_attention_size=1_000_000,
+        kv_cache: torch.Tensor,
+        local_end_index: int,
+        global_end_index: int,
+        current_start: int = 0,
+        max_attention_size: int = 1_000_000,
     ):
         r"""
         Args:
@@ -117,7 +117,7 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+        frame_seqlen = math.prod(grid_sizes[0][1:])
         current_start_frame = current_start // frame_seqlen
         roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         roped_key = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
@@ -129,14 +129,14 @@ class CausalWanSelfAttention(nn.Module):
         num_new_tokens = roped_query.shape[1]
         if (
             self.local_attn_size != -1
-            and (current_end > global_end_index.item())
-            and (num_new_tokens + local_end_index.item() > kv_cache_size)
+            and (current_end > global_end_index)
+            and (num_new_tokens + local_end_index > kv_cache_size)
         ):
             # Calculate the number of new tokens added in this step
             # Shift existing cache content left to discard oldest tokens
             # Clone the source slice to avoid overlapping memory error
-            num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
-            num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
+            num_evicted_tokens = num_new_tokens + local_end_index - kv_cache_size
+            num_rolled_tokens = local_end_index - num_evicted_tokens - sink_tokens
             kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
                 :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
             ].clone()
@@ -144,7 +144,7 @@ class CausalWanSelfAttention(nn.Module):
                 :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
             ].clone()
             # Insert the new keys/values at the end
-            new_local_end_index = local_end_index.item() + current_end - global_end_index.item() - num_evicted_tokens
+            new_local_end_index = local_end_index + current_end - global_end_index - num_evicted_tokens
             local_start_index = new_local_end_index - num_new_tokens
             kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
             kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
@@ -152,8 +152,8 @@ class CausalWanSelfAttention(nn.Module):
             # Assign new keys/values directly up to current_end
             new_local_end_index = local_end_index.item() + current_end - global_end_index.item()
             local_start_index = new_local_end_index - num_new_tokens
-            kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
-            kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
+
+            kv_cache[:, :, local_start_index:new_local_end_index] = torch.stack((roped_key, v))
 
         k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
         v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
@@ -645,7 +645,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
                     "current_start": current_start,
                 }
             )
-            x = block(x, **kwargs)
+            x = block(x.float(), **kwargs)
 
         if not last_stage:
             model_dtype = next(self.parameters()).dtype
