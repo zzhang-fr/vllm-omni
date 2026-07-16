@@ -3,9 +3,10 @@
 stage_args:
   - stage_id: 0
     stage_type: diffusion
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    model_class_name: LingbotWorldFastPipeline
     runtime:
       process: true
-      devices: "0"
     final_output: true
     final_output_type: image
     engine_args:

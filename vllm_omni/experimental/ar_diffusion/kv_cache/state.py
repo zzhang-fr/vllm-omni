@@ -10,7 +10,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
     ARDiffusionPagedLayerContext,
 )
 
-_log = init_logger(__name__)
+logger = init_logger(__name__)
 
 
 class ARDiffusionKVState:
@@ -94,7 +94,7 @@ class ARDiffusionKVState:
             max_video_tokens=int(self.kv_cache.spec.sliding_window),
         )
         self._paged_pending[is_negative] = forward_ctx
-        _log.debug(
+        logger.debug(
             "AR-Diffusion GET   [%s] source=paged-attn layers=%d history_blocks=%d seq_len=%d commit_current=%s",
             branch,
             self.num_layers,
@@ -115,7 +115,7 @@ class ARDiffusionKVState:
             for _ in range(n_chunks):
                 ctx.adapter.on_chunk_committed()
             self._committed[is_negative] += ctx.seq_len
-            _log.debug(
+            logger.debug(
                 "AR-Diffusion COMMIT [%s] paged-attn new_tokens=%d chunks=%d resident=%d/%d",
                 branch,
                 ctx.seq_len,
@@ -175,7 +175,7 @@ class ARDiffusionKVState:
         if not keep_cross_text:
             self._cross_text_populated = {False: False, True: False}
         self._cross_img_populated = {False: False, True: False}
-        _log.info(
+        logger.info(
             "AR-Diffusion RESET [%s/%s] session KV cleared (window boundary; cross text %s)",
             pos_id,
             neg_id,

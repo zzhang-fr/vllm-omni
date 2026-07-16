@@ -620,7 +620,8 @@ class OmniDiffusionConfig:
     # config). Programmatic callers may pass a DiffusionEngine subclass
     # directly — hence ``str | type`` (structured-config mirrors should expose
     # the string form only).
-    engine_backend: str | type = "default"
+    engine_backend: str | type = "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine"
+    # engine_backend: str | type = "default"
 
     # Optional override for the diffusion model runner class (import path).
     # Precedence in the worker: this override > the runner declared by the

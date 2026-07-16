@@ -47,6 +47,7 @@ def resolve_ar_diffusion_kv_config(od_config: OmniDiffusionConfig) -> ARDiffusio
         model_config = getattr(od_config, "model_config", None)
         if isinstance(model_config, dict):
             raw = model_config.get("ar_diffusion_kv_config")
+
     if isinstance(raw, ARDiffusionKVConfig):
         return dataclasses.replace(raw, enable=True)
     if isinstance(raw, dict):
@@ -210,6 +211,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         except Exception:
             cfg_world = 1
         local_branches = 1 if cfg_world >= 2 else 2
+        logger.critical(f"Local branches: {local_branches}")
+        local_branches = 1
         logger.info(
             "AR-Diffusion preallocating (paged): frame_seqlen=%d num_frame_per_block=%d "
             "local_attn_size=%d -> chunk_size=%d window_chunks=%d (window=%d tokens)",
@@ -234,7 +237,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_frame_per_block=num_frame_per_block,
         )
 
-    def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def execute_model(self, req: OmniDiffusionRequest, kv_prefetch_jobs: dict | None = None) -> DiffusionOutput:
         # KV disabled -> base behavior, unchanged.
         if self.kv_cache is None:
             return super().execute_model(req)

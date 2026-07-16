@@ -1,3 +1,4 @@
+import itertools
 import logging
 import math
 import os
@@ -31,6 +32,7 @@ from .cam_utils import (
     get_plucker_embeddings,
     interpolate_camera_poses,
 )
+from .flow_scheduler import LingbotFlowScheduler
 from .fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .state_lingbot_world_fast import LingbotWorldFastState
 from .wan_fast import WanModelFast
@@ -74,12 +76,75 @@ def get_lingbot_world_fast_post_process_func(
 
 
 class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInput, CFGParallelMixin):
+    _ar_diffusion_kv_state = None  # set by the runner before each forward
+
+    def _kv_get(self, seq_len=None, update_kv_cache=False):
+        return self._ar_diffusion_kv_state.get_kv_caches(
+            is_negative=False,
+            seq_len=seq_len,
+            commit_current=update_kv_cache,
+        )
+
+    def _kv_commit(self):
+        self._ar_diffusion_kv_state.commit_paged_context(is_negative=False)
+
+    def _kv_get_cross(self):
+        """Cross-attn cache from the engine pool (text k/v)."""
+        return self._ar_diffusion_kv_state.get_cross_kv_caches(is_negative=False)
+
+    def _kv_populate_cross(self, context: torch.Tensor) -> None:
+        s = self._ar_diffusion_kv_state
+        is_negative = False
+
+        projected = self.transformer.text_embedding(
+            torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+        )
+        for i, block in enumerate(self.transformer.blocks):
+            ca = block.cross_attn
+            n, d = ca.num_heads, ca.head_dim
+            k = v = None
+            if projected is not None:
+                k = ca.norm_k(ca.k(projected)).unflatten(-1, (n, d))
+                v = ca.v(projected).unflatten(-1, (n, d))
+            s.kv_cache.write_cross_kv(i, is_negative, k, v)
+        s._cross_text_populated[is_negative] = True
+        logger.info(
+            "AR-Diffusion CROSS POPULATE [%s]: %d layers",
+            "neg" if is_negative else "pos",
+            len(self.transformer.blocks),
+        )
+
+    def _kv_reset(self, clear_video_latents: bool = True):
+        """Reset the engine's pooled session window plus the model's non-KV state.
+
+        DreamZero resets at the attention-window boundary; the engine pool drops the
+        same window so the next forward starts fresh. ``clear_video_latents=False``
+        keeps the accumulated video latents for export.
+
+        ``clear_video_latents=False`` also marks a window ("inference") reset: the
+        prompt is unchanged, so the pool keeps the text cross-attn K/V and only the
+        image half repopulates on the restart forward.
+        """
+        self.state.reset()
+        self._ar_diffusion_kv_state.reset(keep_cross_text=False)
+
     def __init__(self, *, od_config: OmniDiffusionConfig):
         super().__init__()
+
+        # engine_backend = str(getattr(od_config, "engine_backend", "") or "")
+        # if "ar_diffusion" not in engine_backend.lower().replace("-", "_"):
+        #     raise ValueError(
+        #         "LingbotWorldFastPipeline requires the AR-Diffusion engine; set "
+        #         "engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine "
+        #         f"in the deploy config (got engine_backend={engine_backend!r})."
+        #     )
+
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
 
         self.device = get_local_device()
+        self.num_layers = od_config.tf_model_config.get("num_layers")
+        self.text_len = od_config.tf_model_config.get("text_len")
 
         self.target_dtype = od_config.dtype
 
@@ -125,7 +190,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         logger.info(f"Creating WanModelFast from {model_path}")
 
-        self.model = WanModelFast(
+        self.transformer = WanModelFast(
             in_dim=od_config.tf_model_config.get("in_dim"),
             dim=od_config.tf_model_config.get("dim"),
             ffn_dim=od_config.tf_model_config.get("ffn_dim"),
@@ -140,12 +205,12 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 model_or_path=model_path,
                 subfolder=CONFIG["fast_noise_checkpoint"],
                 revision=None,
-                prefix="model.",
+                prefix="transformer.",
                 fall_back_to_pt=True,
             ),
         ]
 
-        self.scheduler = FlowUniPCMultistepScheduler(
+        self.base_scheduler = FlowUniPCMultistepScheduler(
             num_train_timesteps=self.num_train_timesteps, shift=1, use_dynamic_shifting=False
         )
 
@@ -164,30 +229,6 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         """
         model.eval().requires_grad_(False)
 
-    def _convert_flow_pred_to_x0(
-        self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor, scheduler
-    ) -> torch.Tensor:
-        """
-        Convert flow matching's prediction to x0 prediction.
-        flow_pred: the prediction with shape [B, C, F, H, W]
-        xt: the input noisy data with shape [B, C, F, H, W]
-        timestep: the timestep with shape [B]
-
-        pred = noise - x0
-        x_t = (1-sigma_t) * x0 + sigma_t * noise
-        we have x0 = x_t - sigma_t * pred
-        """
-        # use higher precision for calculations
-        original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device), [flow_pred, xt, scheduler.sigmas, scheduler.timesteps]
-        )
-        timestep_id = torch.argmin((timesteps - timestep).abs())
-        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        x0_pred = xt - sigma_t * flow_pred
-
-        return x0_pred.to(original_dtype)
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -201,11 +242,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         prompt = req.prompts[0].get("prompt")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {})
 
-        session_id = req.sampling_params.extra_args.get("session_id")
-
-        if session_id is None:
-            # Create a unique id if none is specified without messing with RNG state
-            session_id = time.time()
+        session_id = req.sampling_params.extra_args.get("session_id", str(time.time()))
 
         session_id = str(session_id)
 
@@ -214,7 +251,8 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         extension = True
 
         if force_reset or self.state.session_id is None or self.state.session_id != session_id:
-            self.state.reset()
+            self._kv_reset()
+            self.state.init_state(self.device, self.num_layers)
             self.state.session_id = session_id
             extension = False
         else:
@@ -228,11 +266,10 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             assert multi_modal_data.get("image") is None, (
                 "image must not be provided on extension calls; it is only used on the first call of a session"
             )
-            assert self.model.config.local_attn_size == -1, (
+            assert self.transformer.config.local_attn_size == -1, (
                 "video extension requires the model to be configured with local_attn_size == -1"
             )
 
-        batch_size = 1
         num_frames = req.sampling_params.num_frames
         # In order to generate something num_frames must be at least 5 since it expects 4*n + 1 as input
         # 25 is the smallest length supported by the model. Smaller values generate tensors with dimension zero/negative
@@ -240,7 +277,6 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         c2ws = camera.get("poses")
         latent_frames_per_chunk = self.od_config.model_config["latent_frames_per_chunk"]
-        max_area = self.od_config.model_config["max_area"]
 
         # Fresh:     4N+1 pixel frames → N+1 latents, the first slot is the anchor.
         # Extension: 4N   pixel frames → N regular latents, no anchor.
@@ -262,12 +298,18 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
             h, w = img.shape[1:]
             aspect_ratio = h / w
-            lat_h = round(
-                np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] // self.patch_size[1] * self.patch_size[1]
-            )
-            lat_w = round(
-                np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] // self.patch_size[2] * self.patch_size[2]
-            )
+
+            # We must have lat_h * lat_f = (72*72) = (2**6)*(3**4) due to limitations of the AR engine kernel
+            # The value 1296 because it must be a multiple of 16 and such that h*w computed below is close to max_area
+            # Also we want lat_h / lat_f to be as close to aspect_ratio as possible. Additionally, both must be even
+            divisors = [(2**x) * (3**y) for (x, y) in itertools.product(range(1, 6), range(5))]
+            target = np.sqrt(1296 * 4 * aspect_ratio)
+            _, lat_h = min([(np.abs(target - div), div) for div in divisors])
+
+            lat_w = 1296 * 4 // lat_h
+
+            logger.critical(f"{target} {lat_w} {lat_h}")
+
             h = lat_h * self.vae_stride[1]
             w = lat_w * self.vae_stride[2]
         else:
@@ -301,11 +343,13 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             msk = torch.zeros(4, new_lat_f, lat_h, lat_w, device=self.device)
 
         # 2. Prepare timesteps
-        self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
-        timesteps = self.scheduler.timesteps[CONFIG["timesteps_index"]]
+        self.base_scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
+        timesteps = self.base_scheduler.timesteps[CONFIG["timesteps_index"]]
+        self.scheduler = LingbotFlowScheduler(self.base_scheduler, timesteps.to(self.device))
 
         context = self.encode_prompt([prompt], self.device)
         context = [t.to(self.device) for t in context]
+        self._kv_populate_cross(context)
 
         dit_cond_dict = None
         Ks = torch.from_numpy(camera.get("intrinsics"))
@@ -331,6 +375,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         c2ws_infer = c2ws_infer.to(self.device).to(torch.float32)
         Ks = Ks.to(self.device).to(torch.float32)
         only_rays_d = False
+
         c2ws_plucker_emb = get_plucker_embeddings(c2ws_infer, Ks, h, w, only_rays_d=only_rays_d)
         c2ws_plucker_emb = rearrange(
             c2ws_plucker_emb,
@@ -369,30 +414,12 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         def noop_no_sync():
             yield
 
-        no_sync_model = getattr(self.model, "no_sync", noop_no_sync)
+        no_sync_model = getattr(self.transformer, "no_sync", noop_no_sync)
 
         # Initialize (fresh) or grow (extension) the KV cache. Cross-attn cache is
         # left untouched on extension so text-context k/v computed on the first call
         # are reused via crossattn_cache[i]["is_init"] == True.
-        model_args = self.model.config
-        transformer_dtype = self.target_dtype
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
-        extra_kv_size = frame_seqlen * new_lat_f
-        head_dim = model_args.dim // model_args.num_heads
-        local_num_heads = model_args.num_heads // self.sp_size
-
-        if not extension:
-            self.state.create_kv_caches(
-                batch_size,
-                transformer_dtype,
-                self.device,
-                extra_kv_size,
-                model_args.num_layers,
-                local_num_heads,
-                head_dim,
-            )
-        else:
-            self.state.extend_kv_caches(extra_kv_size)
 
         # Total cache size after this call, used both as the per-query attention
         # window and as the absolute-token offset base for the chunk loop.
@@ -413,6 +440,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(latent_frames_per_chunk, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
+
             for chunk_id in tqdm(range(num_inference_chunk)):
                 current_latent = latents_chunk[chunk_id]
                 current_condition = condition_chunk[chunk_id]
@@ -423,48 +451,20 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 }
 
                 kwargs = {
+                    "current_latent": current_latent,
+                    "timesteps": timesteps,
                     "context": [context[0]],
                     "seq_len": max_seq_len,
                     "y": [current_condition],
                     "dit_cond_dict": dit_cond_dict,
-                    "kv_cache": self.state.get_kv_cache(),
-                    "local_end_index": self.state.local_end_index,
-                    "global_end_index": self.state.global_end_index,
-                    "crossattn_cache": self.state.get_crossattn_caches(),
                     "current_start": start_token_offset + chunk_id * latent_frames_per_chunk * frame_seqlen,
                     "max_attention_size": total_kv_size,
+                    "pred_latent_chunks": pred_latent_chunks,
+                    "seed_g": seed_g,
+                    "chunk_id": chunk_id,
                 }
 
-                for timestep_idx in range(len(timesteps)):
-                    latent_model_input = [current_latent.to(self.device)]
-                    current_timestep = [timesteps[timestep_idx]]
-
-                    timestep = torch.stack(current_timestep).to(self.device)
-
-                    noise_pred = self.model(x=latent_model_input, t=timestep, **kwargs)[0]
-
-                    x0 = self._convert_flow_pred_to_x0(
-                        flow_pred=noise_pred,
-                        xt=current_latent,
-                        timestep=current_timestep[0],
-                        scheduler=self.scheduler,
-                    )
-
-                    if timestep_idx < len(timesteps) - 1:
-                        next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(
-                            x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep
-                        )
-                    else:
-                        # note return x0
-                        break
-
-                pred_latent_chunks.append(x0)
-
-                # Update kv cache
-                context_timestep = [timesteps[-1] * 0.0]
-                timestep = torch.stack(context_timestep).to(self.device)
-                self.model(x=[x0], t=timestep, **kwargs)
+                self.diffuse(**kwargs)
 
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
@@ -500,6 +500,96 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         self.state.advance(new_lat_f)
 
         return DiffusionOutput(output=videos[0])
+
+    def diffuse(
+        self,
+        timesteps,
+        current_latent,
+        context,
+        seq_len,
+        y,
+        dit_cond_dict,
+        current_start,
+        max_attention_size,
+        pred_latent_chunks,
+        seed_g,
+        chunk_id,
+    ):
+        kwargs = {
+            "context": context,
+            "seq_len": (chunk_id + 1) * seq_len,
+            "y": y,
+            "dit_cond_dict": dit_cond_dict,
+            "kv_cache": self._kv_get(seq_len * (chunk_id + 1), False),
+            "local_end_index": self.state.local_end_index,
+            "global_end_index": self.state.global_end_index,
+            "crossattn_cache": self._kv_get_cross(),
+            "current_start": current_start,
+            "max_attention_size": max_attention_size,
+        }
+
+        for timestep_idx in range(len(timesteps)):
+            current_timestep = [timesteps[timestep_idx]]
+
+            timestep = torch.stack(current_timestep).to(self.device)
+
+            kwargs.update({"x": [current_latent], "t": timestep})
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=False,
+                positive_kwargs=kwargs,
+                negative_kwargs=None,
+                cfg_normalize=False,
+                true_cfg_scale=0.0,
+            )
+
+            current_latent = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, current_latent, do_true_cfg=False)
+
+        pred_latent_chunks.append(current_latent)
+
+        # Update kv cache
+        context_timestep = [timesteps[-1] * 0.0]
+        timestep = torch.stack(context_timestep).to(self.device)
+
+        kwargs.update(
+            {
+                "x": [current_latent],
+                "t": timestep,
+                "update_kv_cache": True,
+                "kv_cache": self._kv_get(seq_len * (chunk_id + 1), True),
+            }
+        )
+
+        noise_pred = self.predict_noise_maybe_with_cfg(
+            do_true_cfg=False,
+            positive_kwargs=kwargs,
+            negative_kwargs=None,
+            cfg_normalize=False,
+            true_cfg_scale=0.0,
+        )
+
+        return current_latent
+
+    def predict_noise(
+        self,
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass through transformer to predict noise.
+
+        Args:
+            current_model: The transformer model to use (transformer or transformer_2)
+            **kwargs: Arguments to pass to the transformer
+
+        Returns:
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
+        """
+        result, _ = self.transformer(**kwargs)
+
+        if kwargs.get("update_kv_cache", False):
+            self._kv_commit()
+
+        return result[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

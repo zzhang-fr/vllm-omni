@@ -1,6 +1,9 @@
 """Some of the functions are borrowed from SelfForcing (https://github.com/guandeh17/Self-Forcing)."""
 
+import logging
 import math
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -10,12 +13,29 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from einops import rearrange
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.models.lingbot_world_fast.state_lingbot_world_fast import CacheIndex
 from vllm_omni.platforms import current_omni_platform
 
-from .state_lingbot_world_fast import CacheIndex
 from .wan_model import rope_params, sinusoidal_embedding_1d
+
+logger = logging.getLogger(__name__)
+
+# AR-Diffusion paged self-attention (in-tree experimental engine). Import at
+# module level so the isinstance check + custom-op call trace cleanly inside
+# the fullgraph-compiled DiT block (an import inside the traced region would
+# graph-break). The model still works without the engine: the payload type is
+# only ever constructed by the AR-Diffusion runner.
+try:
+    from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+        ARDiffusionPagedLayerInputs,
+        paged_write_attn,
+    )
+except ImportError:  # pragma: no cover - experimental package always ships in-tree
+    ARDiffusionPagedLayerInputs = None
+    paged_write_attn = None
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
@@ -51,18 +71,22 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
 
 class CausalWanSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, local_attn_size=-1, sink_size=0, qk_norm=True, eps=1e-6):
-        assert dim % num_heads == 0
+    def __init__(self, dim, num_heads, local_attn_size=-1, sink_size=0, qk_norm=True, eps=1e-6) -> None:
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}.")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        tp_size = 1
+        if num_heads % tp_size != 0:
+            raise ValueError(f"num_heads={num_heads} must be divisible by tp_size={tp_size}.")
+        self.tp_num_heads = num_heads // tp_size
+        self.tp_inner_dim = self.tp_num_heads * self.head_dim
         self.local_attn_size = local_attn_size
-        self.sink_size = sink_size
-        self.qk_norm = qk_norm
-        self.eps = eps
+        self.max_attention_size = 1_000_000
+        self.num_frame_per_block = 4
 
-        # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
@@ -80,26 +104,18 @@ class CausalWanSelfAttention(nn.Module):
 
     def forward(
         self,
-        x,
-        seq_lens,
-        grid_sizes,
-        freqs,
-        kv_cache=None,
+        x: torch.Tensor,
+        grid_sizes: torch.Tensor,
+        freqs: torch.Tensor,
+        kv_cache: torch.Tensor | Any | None = None,
         local_end_index=None,
         global_end_index=None,
         current_start=0,
         max_attention_size=1_000_000,
-    ):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            block_mask (BlockMask)
-        """
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Inference-only forward (KV cache path)."""
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        # query, key, value function
         def qkv_fn(x):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -108,55 +124,48 @@ class CausalWanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        updated_kv_cache: torch.Tensor | None = None
+
         frame_seqlen = math.prod(grid_sizes[0][1:]).item()
         current_start_frame = current_start // frame_seqlen
+
         roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
         roped_key = causal_rope_apply(k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
-        current_end = current_start + roped_query.shape[1]
-        sink_tokens = self.sink_size * frame_seqlen
-        # If we are using local attention and the current KV cache size is larger than the local attention size,
-        # then we need to truncate the KV cache
-        kv_cache_size = kv_cache[CacheIndex.K].shape[1]
         num_new_tokens = roped_query.shape[1]
-        if (
-            self.local_attn_size != -1
-            and (current_end > global_end_index.item())
-            and (num_new_tokens + local_end_index.item() > kv_cache_size)
-        ):
-            # Calculate the number of new tokens added in this step
-            # Shift existing cache content left to discard oldest tokens
-            # Clone the source slice to avoid overlapping memory error
-            num_evicted_tokens = num_new_tokens + local_end_index.item() - kv_cache_size
-            num_rolled_tokens = local_end_index.item() - num_evicted_tokens - sink_tokens
-            kv_cache[CacheIndex.K][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.K][
-                :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-            ].clone()
-            kv_cache[CacheIndex.V][:, sink_tokens : sink_tokens + num_rolled_tokens] = kv_cache[CacheIndex.V][
-                :, sink_tokens + num_evicted_tokens : sink_tokens + num_evicted_tokens + num_rolled_tokens
-            ].clone()
-            # Insert the new keys/values at the end
-            new_local_end_index = local_end_index.item() + current_end - global_end_index.item() - num_evicted_tokens
-            local_start_index = new_local_end_index - num_new_tokens
-            kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
-            kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
+        current_end = current_start + roped_query.shape[1]
+
+        if ARDiffusionPagedLayerInputs is not None and isinstance(kv_cache, ARDiffusionPagedLayerInputs):
+            # Fused write+attend custom op: one opaque node in the compiled
+            # graph (slot writes + FlashAttention block-table kernel inside).
+            # Metadata tensors were prepared once per forward in _forward_blocks.
+            q_cat = roped_query
+
+            x = paged_write_attn(
+                kv_cache,
+                q_cat[0],
+                roped_key[0],
+                v[0],
+                None,
+                None,
+                self.head_dim**-0.5,
+            ).unsqueeze(0)
         else:
-            # Assign new keys/values directly up to current_end
             new_local_end_index = local_end_index.item() + current_end - global_end_index.item()
             local_start_index = new_local_end_index - num_new_tokens
             kv_cache[CacheIndex.K][:, local_start_index:new_local_end_index] = roped_key
             kv_cache[CacheIndex.V][:, local_start_index:new_local_end_index] = v
 
-        k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-        v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
-        x = self.attn(roped_query, k_cache, v_cache)
+            k_cache = kv_cache[CacheIndex.K][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
+            v_cache = kv_cache[CacheIndex.V][:, max(0, new_local_end_index - max_attention_size) : new_local_end_index]
+            x = self.attn(roped_query, k_cache, v_cache)
+            updated_kv_cache = torch.stack([k_cache, v_cache], dim=0)
 
-        global_end_index.fill_(current_end)
-        local_end_index.fill_(new_local_end_index)
+            global_end_index.fill_(current_end)
+            local_end_index.fill_(new_local_end_index)
 
-        # output
         x = x.flatten(2)
         x = self.o(x)
-        return x
+        return x, updated_kv_cache
 
 
 class WanCrossAttention(nn.Module):
@@ -193,24 +202,28 @@ class WanCrossAttention(nn.Module):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
+        del context_lens
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
-        if crossattn_cache is not None:
-            if not crossattn_cache.get("is_init", False):
-                crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
-                crossattn_cache[CacheIndex.K] = k
-                crossattn_cache[CacheIndex.V] = v
-            else:
-                k = crossattn_cache[CacheIndex.K]
-                v = crossattn_cache[CacheIndex.V]
-        else:
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+        # if crossattn_cache is not None:
+        #     if not crossattn_cache["is_init"]:
+        #         crossattn_cache["is_init"] = True
+        #         k = self.norm_k(self.k(context)).unflatten(2, (n, d))
+        #         v = self.v(context).unflatten(2, (n, d))
+        #         crossattn_cache[CacheIndex.K] = k
+        #         crossattn_cache[CacheIndex.V] = v
+        #     else:
+        #         k = crossattn_cache[CacheIndex.K]
+        #         v = crossattn_cache[CacheIndex.V]
+        # else:
+        #     k = self.norm_k(self.k(context)).unflatten(2, (n, d))
+        #     v = self.v(context).unflatten(2, (n, d))
+
+        k = crossattn_cache["k"]
+        v = crossattn_cache["v"]
 
         # compute attention
         x = self.attn(q, k, v)
@@ -281,9 +294,8 @@ class CausalWanAttentionBlock(nn.Module):
             e = (self.modulation.unsqueeze(0) + e).chunk(6, dim=2)
         assert e[0].dtype == torch.float32
         # self-attention
-        y = self.self_attn(
+        y, updated_kv_cache = self.self_attn(
             self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
-            seq_lens,
             grid_sizes,
             freqs,
             kv_cache,
@@ -313,7 +325,7 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
-        return x
+        return x, updated_kv_cache
 
 
 class CausalHead(nn.Module):
@@ -373,6 +385,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
+        num_frame_per_block=4,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -418,7 +431,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         self.model_type = model_type
 
-        self.task_type = "i2v"
+        self.task_type = "t2v"
         self.patch_size = patch_size
         self.text_len = text_len
         self.in_dim = in_dim
@@ -433,6 +446,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+        self.num_frame_per_block = num_frame_per_block
+        self.frame_seqlen = 1296
 
         if control_type == "cam":
             control_dim = 6
@@ -491,6 +506,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         crossattn_cache=None,
         current_start=0,
         max_attention_size=1_000_000,
+        **kwargs,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -588,6 +604,19 @@ class WanModelFast(ModelMixin, ConfigMixin):
             dit_cond_dict = dict(dit_cond_dict)
             dit_cond_dict["c2ws_plucker_emb"] = c2ws_plucker_emb + c2ws_hidden_states
 
+        if kv_cache and getattr(kv_cache[0], "is_ar_diffusion_paged_context", False):
+            fctx = kv_cache[0].forward_ctx
+            if seq_len != fctx.seq_len:
+                raise RuntimeError(
+                    f"AR-Diffusion paged context seq_len={fctx.seq_len} but current video KV has {seq_len} tokens"
+                )
+            fctx.prepare(
+                device=x.device,
+                action_len=0,
+                query_len=int(x.shape[1]),
+            )
+            kv_cache = [c.to_layer_inputs() for c in kv_cache]
+
         # arguments
         kwargs = dict(
             e=e0,
@@ -600,6 +629,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
             max_attention_size=max_attention_size,
         )
 
+        updated_kv_caches: list[torch.Tensor | None] = []
         for block_index, block in enumerate(self.blocks):
             kwargs.update(
                 {
@@ -610,7 +640,8 @@ class WanModelFast(ModelMixin, ConfigMixin):
                     "current_start": current_start,
                 }
             )
-            x = block(x, **kwargs)
+            x, updated_kv_cache = block(x, **kwargs)
+            updated_kv_caches.append(updated_kv_cache)
 
         # head
         x = self.head(x, e)
@@ -618,7 +649,7 @@ class WanModelFast(ModelMixin, ConfigMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
 
-        return [u.float() for u in x]
+        return [u.float() for u in x], updated_kv_caches
 
     def unpatchify(self, x, grid_sizes):
         r"""
@@ -668,3 +699,15 @@ class WanModelFast(ModelMixin, ConfigMixin):
 
         # init output layer
         nn.init.zeros_(self.head.head.weight)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params

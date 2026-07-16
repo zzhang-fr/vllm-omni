@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+logger = logging.getLogger(__name__)
 
 # Set by ARDiffusionPagedForwardContext.prepare() before each branch forward and
 # read by the fused write+attend custom op below. The pools are process-lifetime
@@ -191,6 +194,8 @@ class ARDiffusionPagedForwardContext:
         action_capacity_blocks = max(1, (action_len + self.block_size - 1) // self.block_size)
         width = max(self.max_video_tokens // self.block_size + action_capacity_blocks, len(block_ids))
         padded = block_ids + [0] * (width - len(block_ids))
+
+        logger.critical(padded)
 
         self.query_len = int(query_len)
         self.kv_len = int(video_len + action_len)
@@ -453,6 +458,9 @@ def _paged_write_attn_impl(
     v_pool = kv._v_pools[layer_idx]
     k_pool[video_slots] = k_curr.to(k_pool.dtype)
     v_pool[video_slots] = v_curr.to(v_pool.dtype)
+    # if layer_idx == 0:
+    #     logger.critical(f"{video_slots[:10]}")
+    #     logger.critical(f"{block_table}")
     if k_act is not None and v_act is not None and k_act.shape[0] > 0:
         k_pool[action_slots] = k_act.to(k_pool.dtype)
         v_pool[action_slots] = v_act.to(v_pool.dtype)

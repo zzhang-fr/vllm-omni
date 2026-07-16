@@ -36,7 +36,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.paged import (
     resident_block_ids,
 )
 
-_log = init_logger(__name__)
+logger = init_logger(__name__)
 
 
 class ARDiffusionRequestAdapter:
@@ -227,7 +227,7 @@ class ARDiffusionKVCache:
             for _ in range(num_layers):
                 self._cross_k.append(torch.empty(cross_shape, dtype=dtype, device=device))
                 self._cross_v.append(torch.empty(cross_shape, dtype=dtype, device=device))
-            _log.info(
+            logger.info(
                 "AR-Diffusion cross-attn pool: %d layers × (%d tok × %d heads × %d) = %.1f MiB",
                 num_layers,
                 cross_attn_length,
@@ -241,7 +241,7 @@ class ARDiffusionKVCache:
                 for _ in range(num_layers):
                     self._cross_k_img.append(torch.empty(img_shape, dtype=dtype, device=device))
                     self._cross_v_img.append(torch.empty(img_shape, dtype=dtype, device=device))
-                _log.info(
+                logger.info(
                     "AR-Diffusion cross-attn IMG pool: %d layers × %d img-tok (I2V)",
                     num_layers,
                     cross_attn_img_length,
@@ -267,6 +267,7 @@ class ARDiffusionKVCache:
             config.gpu_memory_fraction,
             self.spec.page_size_bytes * num_layers,
         )
+        logger.critical(f"{num_blocks} {config.gpu_memory_fraction}")
         # Floor: one forward needs the resident window plus the in-flight chunk
         # (num_frame_per_block frame-blocks) for every branch THIS rank runs,
         # with a little eviction-transient headroom. The memory-fraction
@@ -274,18 +275,18 @@ class ARDiffusionKVCache:
         # paging at the true frame_seqlen makes each block larger and the pool
         # fewer-blocks — so guarantee the minimum the rollout cannot run without,
         # otherwise allocate_chunk hits an exhausted pool mid-forward.
-        min_blocks = self.local_branches * (config.window_chunks + self.num_frame_per_block) + 2
-        if num_blocks < min_blocks:
-            _log.warning(
-                "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
-                "floor (%d local CFG branch(es) x (window_chunks=%d + num_frame_per_block=%d) + 2 headroom)",
-                num_blocks,
-                min_blocks,
-                self.local_branches,
-                config.window_chunks,
-                self.num_frame_per_block,
-            )
-            num_blocks = min_blocks
+        # min_blocks = self.local_branches * (config.window_chunks + self.num_frame_per_block) + 2
+        # if num_blocks < min_blocks:
+        #     logger.warning(
+        #         "AR-Diffusion KV pool: memory-fraction sizing gave %d blocks; raising to the %d-block "
+        #         "floor (%d local CFG branch(es) x (window_chunks=%d + num_frame_per_block=%d) + 2 headroom)",
+        #         num_blocks,
+        #         min_blocks,
+        #         self.local_branches,
+        #         config.window_chunks,
+        #         self.num_frame_per_block,
+        #     )
+        #     num_blocks = min_blocks
         layer_names = [f"ar_diffusion.layer.{i}" for i in range(num_layers)]
         self.manager = build_kv_manager(self.spec, layer_names, num_blocks, max_model_len)
         self.managed_num_blocks = num_blocks
@@ -307,6 +308,7 @@ class ARDiffusionKVCache:
         self._kv_pools: list[torch.Tensor] = []
         self._k_pools: list[torch.Tensor] = []
         self._v_pools: list[torch.Tensor] = []
+        logger.critical(f"{self.num_blocks_total} {self.managed_num_blocks} {self.scratch_num_blocks}")
         if device is not None:
             self._kv_pools, self._k_pools, self._v_pools = allocate_kv_pool_with_views(
                 self.num_blocks_total,
@@ -375,11 +377,11 @@ class ARDiffusionKVCache:
             prefill_prefix_tokens=prefill_prefix_tokens,
         )
         self._adapters[request_id] = adapter
-        _log.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
+        logger.debug("AR-Diffusion begin_request: req=%s prefill=%d", request_id, prefill_prefix_tokens)
         return adapter
 
     def end_request(self, adapter: ARDiffusionRequestAdapter) -> None:
-        _log.debug(
+        logger.debug(
             "AR-Diffusion end_request: req=%s chunks=%d free=%d",
             adapter.request_id,
             adapter.completed_chunks,
@@ -400,7 +402,7 @@ class ARDiffusionKVCache:
             raise RuntimeError("AR-Diffusion KV pool exhausted while allocating a chunk")
         table = self.block_table(adapter)
         resident = resident_block_ids(table, self.null_block_id)
-        _log.debug(
+        logger.debug(
             "AR-Diffusion allocate_chunk: req=%s chunk=%d table_len=%d resident=%d free=%d",
             adapter.request_id,
             adapter.completed_chunks,
@@ -465,9 +467,9 @@ class ARDiffusionKVCache:
         advances the adapter only after the forward succeeds. Call once per
         committed chunk, not per denoise step.
         """
-        _log.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
+        logger.debug("AR-Diffusion commit: req=%s before=%d", adapter.request_id, adapter.completed_chunks)
         adapter.on_chunk_committed()
-        _log.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
+        logger.debug("AR-Diffusion commit: req=%s after=%d", adapter.request_id, adapter.completed_chunks)
 
     # -- pool-backed K/V access --------------------------------------------
 
@@ -480,7 +482,7 @@ class ARDiffusionKVCache:
     ) -> None:
         """Write one layer's committed-chunk K/V into the pool."""
         slots = self.chunk_write_slots(adapter)
-        _log.debug(
+        logger.debug(
             "AR-Diffusion write: req=%s layer=%d chunk=%d shapes=%s dev=%s",
             adapter.request_id,
             layer_index,

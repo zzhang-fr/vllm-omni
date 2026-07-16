@@ -25,7 +25,7 @@ class ARDiffusionKVConfig:
     # DreamZero-style window reset vs. VGGT-style sliding replace.
     reset_at_boundary: bool = False
     # Fraction of free device memory budgeted for the AR-Diffusion KV pool.
-    gpu_memory_fraction: float = 0.1
+    gpu_memory_fraction: float = 0.4
     # When CUDA graph / torch.compile is on (not enforce_eager), pre-capture the
     # DiT graphs for every window-fill shape at load time via a synthetic rollout,
     # so the serving run is fast from the first chunk. No effect when eager.

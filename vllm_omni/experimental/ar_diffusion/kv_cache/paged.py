@@ -21,8 +21,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+logger = init_logger(__name__)
 
 try:
     from vllm.v1.kv_cache_spec_registry import register_kv_cache_spec
