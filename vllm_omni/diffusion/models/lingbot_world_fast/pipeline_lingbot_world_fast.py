@@ -543,7 +543,9 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 true_cfg_scale=0.0,
             )
 
-            current_latent = self.scheduler_step_maybe_with_cfg(noise_pred, timestep, current_latent, do_true_cfg=False)
+            current_latent = self.scheduler_step_maybe_with_cfg(
+                noise_pred, timestep, current_latent, do_true_cfg=False, generator=seed_g
+            )
 
         pred_latent_chunks.append(current_latent)
 
