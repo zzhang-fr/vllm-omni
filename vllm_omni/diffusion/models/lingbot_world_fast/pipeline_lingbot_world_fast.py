@@ -517,10 +517,10 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
     ):
         kwargs = {
             "context": context,
-            "seq_len": (chunk_id + 1) * seq_len,
+            "seq_len": seq_len,
             "y": y,
             "dit_cond_dict": dit_cond_dict,
-            "kv_cache": self._kv_get(seq_len * (chunk_id + 1), False),
+            "kv_cache": self._kv_get(seq_len, False),
             "local_end_index": self.state.local_end_index,
             "global_end_index": self.state.global_end_index,
             "crossattn_cache": self._kv_get_cross(),
@@ -556,7 +556,7 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                 "x": [current_latent],
                 "t": timestep,
                 "update_kv_cache": True,
-                "kv_cache": self._kv_get(seq_len * (chunk_id + 1), True),
+                "kv_cache": self._kv_get(seq_len, True),
             }
         )
 
