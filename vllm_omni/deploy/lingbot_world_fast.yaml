@@ -17,3 +17,5 @@ stage_args:
         vae_stride: [4, 8, 8]
         latent_frames_per_chunk: 3
         max_area: 399360  # 480 * 832
+        ar_diffusion_kv_config:
+          gpu_memory_fraction: 0.6
