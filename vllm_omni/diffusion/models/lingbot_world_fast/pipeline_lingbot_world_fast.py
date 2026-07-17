@@ -269,6 +269,21 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             assert self.transformer.config.local_attn_size == -1, (
                 "video extension requires the model to be configured with local_attn_size == -1"
             )
+            # The engine KV pool and this pipeline state are torn down through
+            # different paths (a failed request or an LRU eviction frees the
+            # engine session, while self.state survives), so an extension call
+            # can otherwise run against an empty KV history and silently produce
+            # a context-free continuation. Fail loudly instead.
+            adapter = self._ar_diffusion_kv_state.pos
+            expected_tokens = self.state.current_lat_f * (self.state.frame_seqlen or 0)
+            if adapter.num_computed_tokens != expected_tokens:
+                raise RuntimeError(
+                    "Lingbot session out of sync with the engine KV pool: the pipeline has "
+                    f"{self.state.current_lat_f} committed latent frames ({expected_tokens} tokens) but the "
+                    f"engine session holds {adapter.num_computed_tokens} tokens. An earlier request on this "
+                    "session probably failed or the session was evicted, which frees the engine KV while the "
+                    "pipeline state survives. Start a new session (force_reset with a fresh image)."
+                )
 
         num_frames = req.sampling_params.num_frames
         # In order to generate something num_frames must be at least 5 since it expects 4*n + 1 as input
