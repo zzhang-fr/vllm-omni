@@ -65,6 +65,9 @@ class DiffusionAttentionBackendEnum(Enum, metaclass=_DiffusionBackendEnumMeta):
     FLASH_ATTN_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttentionHubBackend"
     FLASH_ATTN_3_HUB = "vllm_omni.diffusion.attention.backends.flash_attn_hub.FlashAttention3HubBackend"
     TRTLLM_ATTN = "vllm_omni.diffusion.attention.backends.trtllm_attn.TrtllmAttentionBackend"
+    # In-tree dispatcher to external sparse-attention kernels registered via the
+    # `vllm_omni.sparse_attn` entry-point group (kernels are NOT vendored here).
+    SPARSE_ATTN = "vllm_omni.diffusion.attention.backends.sparse_attn.SparseAttentionBackend"
 
     def get_path(self, include_classname: bool = True) -> str:
         """Get the class path for this backend (respects overrides).

@@ -22,6 +22,7 @@ from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.attention.per_forward_publish import register_per_forward_hooks
 from vllm_omni.diffusion.cache.cachedit import cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -313,6 +314,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 enabled=True,
                 model_tag=self.od_config.model_class_name,
             )
+
+        # Generically publish per-forward attention state — denoise loop length
+        # and video geometry (no per-model edits). Registered last so the hook
+        # lands on the final transformer objects, after torch.compile / offload /
+        # cache backends have wrapped them.
+        register_per_forward_hooks(self.pipeline)
 
         logger.info("Model runner: Initialization complete.")
 

@@ -29,6 +29,21 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    # Length of the denoise loop currently being run. Published generically by
+    # the framework (a forward pre-hook on the transformer, from the pipeline's
+    # diffusers-convention num_timesteps) — not by model code — so step-aware
+    # attention backends can compute a progress fraction
+    # (denoise_step_idx / total_denoise_steps).
+    total_denoise_steps: int | None = None
+    # Per-forward video geometry as RAW, model-agnostic primitives, published
+    # generically by the framework (a forward pre-hook on the transformer) — not
+    # by model code — before attention runs, so structure-aware sparse kernels can
+    # map the flat token sequence back to (frame, patch) coordinates.
+    # latent_shape = post-VAE pre-patch grid (T, H, W); patch_size = (p_t, p_h, p_w).
+    # The post-patch grid is (T // p_t, H // p_h, W // p_w); the dispatcher's
+    # default resolver derives total_latent_frames / patches_per_frame from these.
+    latent_shape: tuple[int, int, int] | None = None
+    patch_size: tuple[int, int, int] | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
@@ -147,6 +162,7 @@ def create_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    total_denoise_steps: int | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
@@ -154,6 +170,7 @@ def create_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        total_denoise_steps=total_denoise_steps,
     )
 
 
@@ -179,6 +196,7 @@ def set_forward_context(
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
     denoise_step_idx: int | None = None,
+    total_denoise_steps: int | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -190,6 +208,7 @@ def set_forward_context(
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
         denoise_step_idx=denoise_step_idx,
+        total_denoise_steps=total_denoise_steps,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
@@ -228,6 +247,43 @@ class DenoiseProgressMixin:
         scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
         _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
+
+
+def set_forward_context_total_denoise_steps(total_steps: int | None) -> None:
+    """Set the total number of denoise steps on the active ForwardContext.
+
+    Published generically by the framework (the transformer forward pre-hook in
+    ``vllm_omni.diffusion.attention.per_forward_publish``, which reads the
+    diffusers-convention ``pipeline.num_timesteps``) — no model code needed.
+    Exposed as public API so a pipeline with a non-standard loop can publish its
+    own value before the loop; the hook never overwrites an already-set value.
+    Step-aware attention backends read it (alongside ``denoise_step_idx``) to
+    compute a progress fraction without per-block call-counting heuristics.
+    """
+    if _forward_context is not None:
+        _forward_context.total_denoise_steps = total_steps
+
+
+def set_forward_context_video_geometry(
+    *,
+    latent_shape: tuple[int, int, int] | None = None,
+    patch_size: tuple[int, int, int] | None = None,
+) -> None:
+    """Set raw per-forward video geometry primitives on the active ForwardContext.
+
+    Called generically by the framework (the transformer forward pre-hook in
+    ``vllm_omni.diffusion.attention.per_forward_publish``) — NOT by model code — so
+    structure-aware sparse attention backends can recover the (frame, patch)
+    layout from the flat token sequence without per-model edits. The dispatcher's
+    default resolver derives ``total_latent_frames`` / ``patches_per_frame`` from
+    these; a plugin ``geometry_fn`` may consume them directly. See the geometry
+    fields on ``PerForwardState``. Each argument is only written when not ``None``.
+    """
+    if _forward_context is not None:
+        if latent_shape is not None:
+            _forward_context.latent_shape = latent_shape
+        if patch_size is not None:
+            _forward_context.patch_size = patch_size
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
